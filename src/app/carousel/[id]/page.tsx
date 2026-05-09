@@ -44,6 +44,30 @@ export default function CarouselEditorPage({ params }: PageProps) {
   // Ref for focusing chat input when + button is clicked
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // Keyboard arrow navigation between slides (skip when typing in inputs/textareas)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      if (!carousel || carousel.slides.length === 0) return;
+      e.preventDefault();
+      const last = carousel.slides.length - 1;
+      setActiveSlide((i) =>
+        e.key === "ArrowLeft" ? Math.max(0, i - 1) : Math.min(last, i + 1)
+      );
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [carousel]);
+
   const fetchCarousel = useCallback(async () => {
     try {
       const res = await fetch(`/api/carousels/${id}`);
@@ -323,6 +347,7 @@ export default function CarouselEditorPage({ params }: PageProps) {
             activeIndex={activeSlide}
             onActiveChange={setActiveSlide}
             showSafeZones={showSafeZones}
+            carouselId={carousel.id}
           />
 
           {/* Caption panel */}

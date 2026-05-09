@@ -20,29 +20,30 @@ export function ReferenceImages({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   const handleUpload = useCallback(
-    async (file: File) => {
+    async (files: File[]) => {
+      if (files.length === 0) return;
       setUploading(true);
       try {
-        // Upload the file
-        const formData = new FormData();
-        formData.append("file", file);
-        const uploadRes = await fetch("/api/upload", {
-          method: "POST",
-          body: formData,
-        });
-        if (!uploadRes.ok) return;
-        const uploadData = await uploadRes.json();
+        for (const file of files) {
+          if (!file.type.startsWith("image/")) continue;
+          const formData = new FormData();
+          formData.append("file", file);
+          const uploadRes = await fetch("/api/upload", {
+            method: "POST",
+            body: formData,
+          });
+          if (!uploadRes.ok) continue;
+          const uploadData = await uploadRes.json();
 
-        // Register as reference image
-        await fetch(`/api/carousels/${carouselId}/references`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: uploadData.url,
-            name: file.name,
-          }),
-        });
-
+          await fetch(`/api/carousels/${carouselId}/references`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: uploadData.url,
+              name: file.name,
+            }),
+          });
+        }
         onImagesChange();
       } catch {
         // ignore
@@ -67,8 +68,10 @@ export function ReferenceImages({
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
-      const file = e.dataTransfer.files[0];
-      if (file && file.type.startsWith("image/")) handleUpload(file);
+      const files = Array.from(e.dataTransfer.files).filter((f) =>
+        f.type.startsWith("image/")
+      );
+      if (files.length > 0) handleUpload(files);
     },
     [handleUpload]
   );
@@ -77,9 +80,10 @@ export function ReferenceImages({
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "image/png,image/jpeg,image/webp";
+    input.multiple = true;
     input.onchange = (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (file) handleUpload(file);
+      const files = Array.from((e.target as HTMLInputElement).files ?? []);
+      if (files.length > 0) handleUpload(files);
     };
     input.click();
   }, [handleUpload]);
@@ -113,7 +117,7 @@ export function ReferenceImages({
         >
           <ImagePlus className="h-4 w-4 mx-auto text-muted-foreground/50 mb-1" />
           <p className="text-[10px] text-muted-foreground">
-            Drop reference images here
+            Drop one or more reference images here
           </p>
           <p className="text-[9px] text-muted-foreground/70">
             The AI will study these to match your style

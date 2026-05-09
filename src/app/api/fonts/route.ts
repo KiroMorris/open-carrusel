@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 
 // Curated list of Google Fonts that work well for social media carousels
 const POPULAR_FONTS = [
+  { name: "Bagel Fat One", category: "display" },
+  { name: "Prompt", category: "sans-serif" },
   { name: "Inter", category: "sans-serif" },
   { name: "Playfair Display", category: "serif" },
   { name: "Montserrat", category: "sans-serif" },

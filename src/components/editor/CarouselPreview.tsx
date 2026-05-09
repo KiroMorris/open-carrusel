@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, type CSSProperties } from "react";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useEffect, useRef, useState, useCallback, useMemo, type CSSProperties } from "react";
+import { ChevronLeft, ChevronRight, Download, Film } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SlideRenderer } from "./SlideRenderer";
 import { SafeZoneOverlay } from "./SafeZoneOverlay";
@@ -13,6 +13,7 @@ interface CarouselPreviewProps {
   activeIndex: number;
   onActiveChange: (index: number) => void;
   showSafeZones?: boolean;
+  carouselId?: string;
 }
 
 export function CarouselPreview({
@@ -21,7 +22,78 @@ export function CarouselPreview({
   activeIndex,
   onActiveChange,
   showSafeZones = false,
+  carouselId,
 }: CarouselPreviewProps) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadingVideo, setDownloadingVideo] = useState(false);
+
+  // Detect animation client-side too, so the MP4 button appears instantly
+  // without waiting on the server to confirm.
+  const activeHasAnimation = useMemo(() => {
+    const html = slides[activeIndex]?.html ?? "";
+    if (!html) return false;
+    if (/@keyframes\s+[\w-]+/i.test(html)) return true;
+    if (/animation\s*:\s*(?!none\b)[^;}\n]+/i.test(html)) return true;
+    return false;
+  }, [slides, activeIndex]);
+
+  const handleDownloadVideo = useCallback(async () => {
+    if (!carouselId || !slides[activeIndex]) return;
+    setDownloadingVideo(true);
+    try {
+      const res = await fetch(
+        `/api/carousels/${carouselId}/slides/${slides[activeIndex].id}/video`,
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(err?.error || "Video export failed");
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const cd = res.headers.get("content-disposition") || "";
+      const match = cd.match(/filename="([^"]+)"/);
+      a.download = match?.[1] || `slide-${activeIndex + 1}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } finally {
+      setDownloadingVideo(false);
+    }
+  }, [carouselId, slides, activeIndex]);
+
+  const handleDownloadSlide = useCallback(async () => {
+    if (!carouselId || !slides[activeIndex]) return;
+    setDownloading(true);
+    try {
+      const res = await fetch(
+        `/api/carousels/${carouselId}/slides/${slides[activeIndex].id}/export`,
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        console.error("Single-slide export failed");
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      // Try to use the filename from Content-Disposition; fall back to slide-N.png
+      const cd = res.headers.get("content-disposition") || "";
+      const match = cd.match(/filename="([^"]+)"/);
+      a.download = match?.[1] || `slide-${activeIndex + 1}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } finally {
+      setDownloading(false);
+    }
+  }, [carouselId, slides, activeIndex]);
   const slide = slides[activeIndex];
   const prevIndexRef = useRef(activeIndex);
   const direction = activeIndex >= prevIndexRef.current ? 12 : -12;
@@ -86,6 +158,38 @@ export function CarouselPreview({
         >
           <ChevronRight className="h-4 w-4" />
         </Button>
+
+        {/* Download this slide (PNG) */}
+        {carouselId && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleDownloadSlide}
+            disabled={downloading}
+            className="absolute top-3 right-14 z-10 bg-white/95 shadow-sm hover:bg-white h-8 gap-1.5 px-3 text-xs"
+            aria-label="Download this slide as PNG"
+            title="Download as PNG"
+          >
+            <Download className="h-3.5 w-3.5" />
+            {downloading ? "Saving…" : "PNG"}
+          </Button>
+        )}
+
+        {/* Download as MP4 (only when slide has CSS animation) */}
+        {carouselId && activeHasAnimation && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleDownloadVideo}
+            disabled={downloadingVideo}
+            className="absolute top-3 right-[170px] z-10 bg-accent text-accent-foreground shadow-sm hover:opacity-90 h-8 gap-1.5 px-3 text-xs"
+            aria-label="Download this slide as MP4 video"
+            title="This slide has animation — download as MP4 (4s)"
+          >
+            <Film className="h-3.5 w-3.5" />
+            {downloadingVideo ? "Rendering…" : "MP4 (4s)"}
+          </Button>
+        )}
       </div>
 
       {/* Slide counter dots */}

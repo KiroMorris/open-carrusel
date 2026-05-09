@@ -52,8 +52,28 @@ export function TopBar({
           </Button>
         </Link>
       )}
-      <div className="flex items-center gap-2 min-w-0">
-        <Layers className="h-5 w-5 text-accent shrink-0" />
+      <div className="flex items-center gap-2.5 min-w-0">
+        <span
+          aria-hidden
+          className="inline-flex items-center justify-center h-7 w-7 rounded-md bg-accent text-[var(--brand-yellow)] text-[14px] shrink-0"
+          style={{ fontFamily: "'Bagel Fat One', sans-serif" }}
+          title="My Turtle"
+        >
+          M
+        </span>
+        {!showBack && (
+          <span
+            aria-hidden
+            className="hidden sm:inline-block text-base shrink-0"
+            style={{
+              fontFamily: "'Bagel Fat One', sans-serif",
+              color: "var(--brand-green)",
+              letterSpacing: "-0.5px",
+            }}
+          >
+            My Turtle
+          </span>
+        )}
         {isEditing && editable ? (
           <input
             ref={inputRef}

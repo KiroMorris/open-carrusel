@@ -4,8 +4,16 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { ReferenceImages } from "./ReferenceImages";
-import { AlertCircle, Plug } from "lucide-react";
+import { AlertCircle, Plug, ImagePlus, Plus, History, Trash2, X } from "lucide-react";
 import type { ReferenceImage } from "@/types/carousel";
+
+interface ArchivedChat {
+  id: string;
+  sessionId: string | null;
+  messages: { id: string; role: "user" | "assistant"; content: string }[];
+  title: string;
+  createdAt: number;
+}
 
 interface Message {
   id: string;
@@ -34,39 +42,230 @@ export function ChatPanel({
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dropUploading, setDropUploading] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [history, setHistory] = useState<ArchivedChat[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const dragCounterRef = useRef(0);
 
-  // Load session ID and chat history from localStorage
-  useEffect(() => {
-    const storedSession = localStorage.getItem(`chat-session-${carouselId}`);
-    if (storedSession) setSessionId(storedSession);
+  const HISTORY_KEY = `chat-history-${carouselId}`;
+  const SESSION_KEY = `chat-session-${carouselId}`;
+  const MESSAGES_KEY = `chat-messages-${carouselId}`;
+
+  const loadHistory = useCallback((): ArchivedChat[] => {
     try {
-      const storedMessages = localStorage.getItem(`chat-messages-${carouselId}`);
-      if (storedMessages) setMessages(JSON.parse(storedMessages));
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
     } catch {
-      // ignore corrupted data
+      return [];
     }
-  }, [carouselId]);
+  }, [HISTORY_KEY]);
 
-  // Persist messages to localStorage
-  const persistMessages = useCallback(
-    (msgs: Message[]) => {
+  const saveHistory = useCallback(
+    (h: ArchivedChat[]) => {
       try {
-        localStorage.setItem(`chat-messages-${carouselId}`, JSON.stringify(msgs));
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
       } catch {
-        // ignore quota errors
+        // ignore quota
       }
     },
-    [carouselId]
+    [HISTORY_KEY]
   );
 
-  const handleClearChat = useCallback(() => {
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      const images = files.filter((f) => f.type.startsWith("image/"));
+      if (images.length === 0) return;
+      setDropUploading(true);
+      try {
+        for (const file of images) {
+          const formData = new FormData();
+          formData.append("file", file);
+          const uploadRes = await fetch("/api/upload", {
+            method: "POST",
+            body: formData,
+          });
+          if (!uploadRes.ok) continue;
+          const uploadData = await uploadRes.json();
+          await fetch(`/api/carousels/${carouselId}/references`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: uploadData.url,
+              name: file.name,
+            }),
+          });
+        }
+        onStreamEnd?.();
+      } finally {
+        setDropUploading(false);
+      }
+    },
+    [carouselId, onStreamEnd]
+  );
+
+  // Track whether we've finished hydrating so we don't overwrite localStorage
+  // with the empty initial state during first render.
+  const hydratedRef = useRef(false);
+
+  // Load session ID and chat history from localStorage on mount / carousel switch
+  useEffect(() => {
+    hydratedRef.current = false;
+    const storedSession = localStorage.getItem(`chat-session-${carouselId}`);
+    setSessionId(storedSession || null);
+    try {
+      const storedMessages = localStorage.getItem(`chat-messages-${carouselId}`);
+      setMessages(storedMessages ? JSON.parse(storedMessages) : []);
+    } catch {
+      setMessages([]);
+    }
+    // Defer marking hydrated so the persistence effect below
+    // doesn't run with the previous carousel's stale state.
+    const t = setTimeout(() => { hydratedRef.current = true; }, 0);
+    return () => clearTimeout(t);
+  }, [carouselId]);
+
+  // Persist messages to localStorage on EVERY change (after hydration)
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    try {
+      if (messages.length === 0) {
+        localStorage.removeItem(`chat-messages-${carouselId}`);
+      } else {
+        localStorage.setItem(`chat-messages-${carouselId}`, JSON.stringify(messages));
+      }
+    } catch {
+      // ignore quota errors
+    }
+  }, [messages, carouselId]);
+
+  // Persist sessionId on EVERY change too
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    try {
+      if (sessionId) {
+        localStorage.setItem(`chat-session-${carouselId}`, sessionId);
+      } else {
+        localStorage.removeItem(`chat-session-${carouselId}`);
+      }
+    } catch {
+      // ignore
+    }
+  }, [sessionId, carouselId]);
+
+  // Legacy callback kept for compatibility with the streaming code below.
+  const persistMessages = useCallback((_msgs: Message[]) => {
+    // The effect above handles persistence automatically.
+  }, []);
+
+  // "New Chat": archive current → clear → start fresh next message
+  // Reads fresh from localStorage so it works even if React state is stale.
+  const handleNewChat = useCallback(() => {
+    console.log("[chat] + New clicked");
+    let currentMessages: typeof messages = [];
+    let currentSessionId: string | null = null;
+    try {
+      const raw = localStorage.getItem(MESSAGES_KEY);
+      if (raw) currentMessages = JSON.parse(raw);
+    } catch (err) {
+      console.warn("[chat] failed to parse stored messages, falling back", err);
+      currentMessages = messages;
+    }
+    currentSessionId = localStorage.getItem(SESSION_KEY) ?? sessionId ?? null;
+    console.log("[chat] archiving", currentMessages.length, "messages");
+
+    if (currentMessages.length > 0) {
+      const firstUser = currentMessages.find((m) => m.role === "user");
+      const title = firstUser
+        ? firstUser.content.slice(0, 60)
+        : "Untitled chat";
+      const archived: ArchivedChat = {
+        id: crypto.randomUUID(),
+        sessionId: currentSessionId,
+        messages: currentMessages,
+        title,
+        createdAt: Date.now(),
+      };
+      const existing = loadHistory();
+      const next = [archived, ...existing].slice(0, 50);
+      console.log("[chat] saving history with", next.length, "items");
+      saveHistory(next);
+      setHistory(next);
+    } else {
+      console.log("[chat] nothing to archive — message list empty");
+    }
     setMessages([]);
     setSessionId(null);
-    localStorage.removeItem(`chat-messages-${carouselId}`);
-    localStorage.removeItem(`chat-session-${carouselId}`);
-  }, [carouselId]);
+    localStorage.removeItem(MESSAGES_KEY);
+    localStorage.removeItem(SESSION_KEY);
+  }, [messages, sessionId, loadHistory, saveHistory, MESSAGES_KEY, SESSION_KEY]);
+
+  const handleResumeArchived = useCallback(
+    (chat: ArchivedChat) => {
+      // Archive what's currently open if it has anything new
+      if (messages.length > 0) {
+        const firstUser = messages.find((m) => m.role === "user");
+        const title = firstUser ? firstUser.content.slice(0, 60) : "Untitled chat";
+        const current: ArchivedChat = {
+          id: crypto.randomUUID(),
+          sessionId,
+          messages,
+          title,
+          createdAt: Date.now(),
+        };
+        const withCurrent = [current, ...loadHistory().filter((c) => c.id !== chat.id)].slice(0, 50);
+        saveHistory(withCurrent);
+        setHistory(withCurrent);
+      }
+      setMessages(chat.messages);
+      setSessionId(chat.sessionId);
+      try {
+        localStorage.setItem(MESSAGES_KEY, JSON.stringify(chat.messages));
+        if (chat.sessionId) {
+          localStorage.setItem(SESSION_KEY, chat.sessionId);
+        } else {
+          localStorage.removeItem(SESSION_KEY);
+        }
+      } catch {
+        // ignore
+      }
+      setShowHistory(false);
+    },
+    [messages, sessionId, loadHistory, saveHistory, MESSAGES_KEY, SESSION_KEY]
+  );
+
+  const handleDeleteArchived = useCallback(
+    (id: string) => {
+      const next = loadHistory().filter((c) => c.id !== id);
+      saveHistory(next);
+      setHistory(next);
+    },
+    [loadHistory, saveHistory]
+  );
+
+  const handleOpenHistory = useCallback(() => {
+    setHistory(loadHistory());
+    setShowHistory(true);
+  }, [loadHistory]);
+
+  // Synthetic "current" entry shown at the top of the history drawer.
+  const currentEntry: (ArchivedChat & { isCurrent: true }) | null =
+    messages.length > 0
+      ? {
+          id: "__current__",
+          sessionId,
+          messages,
+          title:
+            messages.find((m) => m.role === "user")?.content.slice(0, 60) ||
+            "Current chat",
+          createdAt: Date.now(),
+          isCurrent: true,
+        }
+      : null;
 
   const handleStopGenerating = useCallback(() => {
     abortRef.current?.abort();
@@ -249,22 +448,71 @@ export function ChatPanel({
   }
 
   return (
-    <div className="h-full flex flex-col">
-      <div className="px-4 py-3 border-b border-border flex items-start justify-between">
-        <div>
+    <div
+      className="h-full flex flex-col relative"
+      onDragEnter={(e) => {
+        if (Array.from(e.dataTransfer.types).includes("Files")) {
+          dragCounterRef.current += 1;
+          setIsDragging(true);
+        }
+      }}
+      onDragOver={(e) => {
+        if (Array.from(e.dataTransfer.types).includes("Files")) {
+          e.preventDefault();
+        }
+      }}
+      onDragLeave={() => {
+        dragCounterRef.current -= 1;
+        if (dragCounterRef.current <= 0) {
+          dragCounterRef.current = 0;
+          setIsDragging(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        dragCounterRef.current = 0;
+        setIsDragging(false);
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length > 0) uploadFiles(files);
+      }}
+    >
+      {(isDragging || dropUploading) && (
+        <div className="absolute inset-0 z-40 bg-accent/15 backdrop-blur-[2px] border-2 border-dashed border-accent rounded-md flex flex-col items-center justify-center pointer-events-none">
+          <ImagePlus className="h-10 w-10 text-accent mb-2" />
+          <p className="text-sm font-medium text-accent">
+            {dropUploading ? "Uploading..." : "Drop images to add as references"}
+          </p>
+          <p className="text-xs text-accent/70 mt-1">
+            Multiple images supported
+          </p>
+        </div>
+      )}
+      <div className="px-4 py-3 border-b border-border flex items-start justify-between gap-2">
+        <div className="min-w-0">
           <h2 className="text-sm font-semibold">AI Assistant</h2>
-          <p className="text-xs text-muted-foreground">
+          <p className="text-xs text-muted-foreground truncate">
             Describe the carousel you want to create
           </p>
         </div>
-        {messages.length > 0 && (
+        <div className="flex items-center gap-1 shrink-0">
           <button
-            onClick={handleClearChat}
-            className="text-[10px] text-muted-foreground hover:text-destructive transition-colors px-1.5 py-0.5 rounded"
+            onClick={handleNewChat}
+            disabled={messages.length === 0}
+            title="Start a new chat (current chat saved to history)"
+            className="text-[11px] flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-40 transition-colors px-2 py-1 rounded"
           >
-            Clear
+            <Plus className="h-3 w-3" />
+            New
           </button>
-        )}
+          <button
+            onClick={handleOpenHistory}
+            title="View chat history for this carousel"
+            className="text-[11px] flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors px-2 py-1 rounded"
+          >
+            <History className="h-3 w-3" />
+            History
+          </button>
+        </div>
       </div>
 
       <ReferenceImages
@@ -308,6 +556,93 @@ export function ChatPanel({
         textareaRef={chatInputRef}
         onStop={handleStopGenerating}
       />
+
+      {/* History drawer */}
+      {showHistory && (
+        <div className="absolute inset-0 z-30 bg-background flex flex-col">
+          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold">Chat history</h3>
+              <p className="text-xs text-muted-foreground">
+                Past chats for this carousel
+              </p>
+            </div>
+            <button
+              onClick={() => setShowHistory(false)}
+              className="h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted"
+              aria-label="Close history"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {!currentEntry && history.length === 0 ? (
+              <div className="p-6 text-center text-muted-foreground">
+                <History className="h-6 w-6 mx-auto mb-2 opacity-40" />
+                <p className="text-sm">No chats yet</p>
+                <p className="text-xs mt-1">
+                  Send a message to start your first chat.
+                </p>
+              </div>
+            ) : (
+              <ul className="divide-y divide-border">
+                {currentEntry && (
+                  <li className="group">
+                    <div className="flex items-start gap-2 px-4 py-3 bg-accent/8 border-l-2 border-accent">
+                      <button
+                        onClick={() => setShowHistory(false)}
+                        className="flex-1 text-left min-w-0"
+                      >
+                        <div className="text-xs font-medium truncate flex items-center gap-2">
+                          <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wider bg-accent text-accent-foreground px-1.5 py-0.5 rounded">
+                            Active
+                          </span>
+                          <span className="truncate">{currentEntry.title}</span>
+                        </div>
+                        <div className="text-[10px] text-muted-foreground mt-1">
+                          {currentEntry.messages.length} message
+                          {currentEntry.messages.length === 1 ? "" : "s"} ·
+                          tap to view
+                        </div>
+                      </button>
+                    </div>
+                  </li>
+                )}
+                {history.map((c) => (
+                  <li key={c.id} className="group">
+                    <div className="flex items-start gap-2 px-4 py-3 hover:bg-muted/50">
+                      <button
+                        onClick={() => handleResumeArchived(c)}
+                        className="flex-1 text-left min-w-0"
+                      >
+                        <div className="text-xs font-medium truncate">
+                          {c.title}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground mt-0.5 flex items-center gap-2">
+                          <span>{new Date(c.createdAt).toLocaleString()}</span>
+                          <span>·</span>
+                          <span>
+                            {c.messages.length} message
+                            {c.messages.length === 1 ? "" : "s"}
+                          </span>
+                        </div>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteArchived(c.id)}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive p-1"
+                        aria-label="Delete archived chat"
+                        title="Delete"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

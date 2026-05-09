@@ -1,16 +1,25 @@
+/* My Turtle brand fonts (must come before tailwindcss import) */
+@import url('https://fonts.googleapis.com/css2?family=Bagel+Fat+One&family=Prompt:wght@300;400;500;600;700&display=swap');
 @import "tailwindcss";
 
 :root {
-  --background: #fafafa;
-  --foreground: #171717;
-  --muted: #f5f5f5;
-  --muted-foreground: #737373;
-  --border: #e5e5e5;
-  --ring: #1a1a2e;
-  --accent: #e94560;
-  --accent-foreground: #ffffff;
-  --surface: #ffffff;
-  --destructive: #ef4444;
+  /* My Turtle brand */
+  --brand-green: #1A4231;
+  --brand-green-deep: #0F2A1F;
+  --brand-yellow: #F4B400;
+  --brand-cream: #F5F2EA;
+  --brand-paper: #FBF8EE;
+
+  --background: #FFFFFF;
+  --foreground: #0F1F18;
+  --muted: #F5F7F5;
+  --muted-foreground: #6B7A72;
+  --border: #E2E8E3;
+  --ring: var(--brand-green);
+  --accent: var(--brand-green);
+  --accent-foreground: var(--brand-yellow);
+  --surface: #FFFFFF;
+  --destructive: #B23A2C;
 
   /* Motion — Emil Kowalski easings (animations.dev) */
   --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
@@ -36,7 +45,15 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), system-ui, sans-serif;
+  font-family: 'Prompt', var(--font-sans), system-ui, sans-serif;
+}
+
+/* Brand display font for the app's own large headings (not slide content) */
+.app-display,
+header h1,
+header h2 {
+  font-family: 'Bagel Fat One', var(--font-sans), sans-serif;
+  letter-spacing: -0.5px;
 }
 
 /* Scrollbar styling */

@@ -4,6 +4,7 @@ import path from "path";
 import sharp from "sharp";
 import { wrapSlideHtml, extractFontFamilies } from "./slide-html";
 import { getInlinedFontCSS } from "./fonts";
+import { exportSlideVideo, hasAnimation } from "./export-video";
 import type { Slide, AspectRatio } from "@/types/carousel";
 import { DIMENSIONS } from "@/types/carousel";
 
@@ -121,28 +122,58 @@ export async function exportSlide(
 }
 
 /**
- * Export all slides of a carousel to PNG buffers.
- * Processes up to 3 slides concurrently.
+ * Export all slides of a carousel.
+ * Slides with CSS animation render as MP4; the rest render as PNG.
+ * PNG slides batch concurrently; videos render serially (each is heavy).
  */
 export async function exportAllSlides(
   slides: Slide[],
   aspectRatio: AspectRatio,
   onProgress?: (current: number, total: number) => void
 ): Promise<{ name: string; buffer: Buffer }[]> {
-  const results: { name: string; buffer: Buffer }[] = [];
-  const CONCURRENCY = 3;
+  const results: { name: string; buffer: Buffer }[] = new Array(slides.length);
+  let done = 0;
+  const tick = () => {
+    done++;
+    onProgress?.(done, slides.length);
+  };
 
-  for (let i = 0; i < slides.length; i += CONCURRENCY) {
-    const batch = slides.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(
-      batch.map(async (slide, batchIdx) => {
-        const idx = i + batchIdx;
+  // Split into PNG and MP4 work lists, preserving original index for filenames.
+  const pngWork: { idx: number; slide: Slide }[] = [];
+  const mp4Work: { idx: number; slide: Slide }[] = [];
+  slides.forEach((slide, idx) => {
+    if (hasAnimation(slide.html)) mp4Work.push({ idx, slide });
+    else pngWork.push({ idx, slide });
+  });
+
+  // PNGs concurrently
+  const CONCURRENCY = 3;
+  for (let i = 0; i < pngWork.length; i += CONCURRENCY) {
+    const batch = pngWork.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      batch.map(async ({ idx, slide }) => {
         const buffer = await exportSlide(slide, aspectRatio);
-        onProgress?.(idx + 1, slides.length);
-        return { name: `slide-${idx + 1}.png`, buffer };
+        results[idx] = { name: `slide-${idx + 1}.png`, buffer };
+        tick();
       })
     );
-    results.push(...batchResults);
+  }
+
+  // MP4s serially — each video render is CPU-heavy, parallel risks OOM/timeouts.
+  for (const { idx, slide } of mp4Work) {
+    try {
+      const buffer = await exportSlideVideo(slide, aspectRatio, { durationSec: 4 });
+      results[idx] = { name: `slide-${idx + 1}.mp4`, buffer };
+    } catch (err) {
+      // Fall back to PNG if video render fails (e.g. ffmpeg missing).
+      console.warn(
+        `Video export for slide ${idx + 1} failed, falling back to PNG:`,
+        err instanceof Error ? err.message : err
+      );
+      const buffer = await exportSlide(slide, aspectRatio);
+      results[idx] = { name: `slide-${idx + 1}.png`, buffer };
+    }
+    tick();
   }
 
   return results;
