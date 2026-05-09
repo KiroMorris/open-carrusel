@@ -13,7 +13,6 @@ import { SlideFilmstrip } from "@/components/editor/SlideFilmstrip";
 import { AspectRatioSelector } from "@/components/editor/AspectRatioSelector";
 import { ExportButton } from "@/components/editor/ExportButton";
 import { CaptionPanel } from "@/components/editor/CaptionPanel";
-import { SafeZoneOverlay } from "@/components/editor/SafeZoneOverlay";
 import { FullscreenPreview } from "@/components/editor/FullscreenPreview";
 import type { Carousel, AspectRatio } from "@/types/carousel";
 
@@ -33,6 +32,11 @@ export default function CarouselEditorPage({ params }: PageProps) {
   const [showSafeZones, setShowSafeZones] = useState(false);
   const [showFullscreen, setShowFullscreen] = useState(false);
 
+  // Phase 3: refine mode toggle, owned at the page level so it persists across
+  // re-renders but resets when the user switches slides (so they can't get
+  // confused about which slide they're editing).
+  const [refineMode, setRefineMode] = useState<"preview" | "refine">("preview");
+
   // Confirm dialog state
   const [confirmState, setConfirmState] = useState<{
     open: boolean;
@@ -44,7 +48,9 @@ export default function CarouselEditorPage({ params }: PageProps) {
   // Ref for focusing chat input when + button is clicked
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Keyboard arrow navigation between slides (skip when typing in inputs/textareas)
+  // Keyboard arrow navigation between slides (skip when typing in inputs/textareas).
+  // Phase 3: also skip arrow nav while in refine mode so Cmd-Z/handles can do
+  // their work without the user accidentally swapping slides mid-edit.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -58,6 +64,7 @@ export default function CarouselEditorPage({ params }: PageProps) {
         return;
       }
       if (!carousel || carousel.slides.length === 0) return;
+      if (refineMode === "refine") return;
       e.preventDefault();
       const last = carousel.slides.length - 1;
       setActiveSlide((i) =>
@@ -66,7 +73,7 @@ export default function CarouselEditorPage({ params }: PageProps) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [carousel]);
+  }, [carousel, refineMode]);
 
   const fetchCarousel = useCallback(async () => {
     try {
@@ -261,18 +268,28 @@ export default function CarouselEditorPage({ params }: PageProps) {
       {/* Main editor area */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Chat panel */}
-        {chatOpen && (
-          <div className="oc-fade w-80 border-r border-border shrink-0 flex flex-col bg-surface">
-            <ChatPanel
-              carouselId={id}
-              claudeAvailable={claudeAvailable}
-              referenceImages={carousel.referenceImages || []}
-              onStreamStart={handleStreamStart}
-              onStreamEnd={handleStreamEnd}
-              chatInputRef={chatInputRef}
-            />
-          </div>
-        )}
+        {chatOpen && (() => {
+          const active = carousel.slides[activeSlide];
+          const activeLocked =
+            !!active?.canvasOverrides &&
+            Object.keys(active.canvasOverrides.layers).length > 0;
+          return (
+            <div className="oc-fade w-80 border-r border-border shrink-0 flex flex-col bg-surface">
+              <ChatPanel
+                carouselId={id}
+                claudeAvailable={claudeAvailable}
+                referenceImages={carousel.referenceImages || []}
+                onStreamStart={handleStreamStart}
+                onStreamEnd={handleStreamEnd}
+                chatInputRef={chatInputRef}
+                activeSlideLocked={activeLocked}
+                activeSlideId={active?.id ?? null}
+                activeSlideNumber={active ? active.order + 1 : null}
+                onSlideUnlocked={fetchCarousel}
+              />
+            </div>
+          );
+        })()}
 
         {/* Right side: toolbar + preview */}
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
@@ -340,7 +357,7 @@ export default function CarouselEditorPage({ params }: PageProps) {
             />
           </div>
 
-          {/* Carousel preview */}
+          {/* Carousel preview — Phase 3: refine mode swaps in the canvas editor. */}
           <CarouselPreview
             slides={carousel.slides}
             aspectRatio={carousel.aspectRatio}
@@ -348,6 +365,19 @@ export default function CarouselEditorPage({ params }: PageProps) {
             onActiveChange={setActiveSlide}
             showSafeZones={showSafeZones}
             carouselId={carousel.id}
+            mode={refineMode}
+            onModeChange={setRefineMode}
+            onOverridesChange={(slideId, overrides) => {
+              setCarousel((prev) => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  slides: prev.slides.map((s) =>
+                    s.id === slideId ? { ...s, canvasOverrides: overrides } : s
+                  ),
+                };
+              });
+            }}
           />
 
           {/* Caption panel */}

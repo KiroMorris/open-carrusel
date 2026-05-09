@@ -1,5 +1,7 @@
-import type { AspectRatio } from "@/types/carousel";
+import type { AspectRatio, CanvasOverrides } from "@/types/carousel";
 import { DIMENSIONS } from "@/types/carousel";
+import { applyOverrides } from "./canvas-overrides";
+import { EDITOR_RUNTIME_JS } from "./editor-runtime.bundle";
 
 /**
  * Extract Google Font family names from slide HTML.
@@ -37,14 +39,31 @@ export function extractFontFamilies(html: string): string[] {
 /**
  * Wraps slide body HTML into a full HTML document at the correct dimensions.
  * This is THE shared rendering contract between preview (iframe) and export (Puppeteer).
+ *
+ * Optional `overrides` are applied to `slideHtml` BEFORE the body is
+ * interpolated, so the resulting document contains the merged layout.
+ *
+ * `editorRuntime` is reserved for Phase 2 (Refine mode iframe). It defaults
+ * to false and Phase 1 emits no `<script>` either way — the export pipeline
+ * should NEVER pass true. A defensive check at the bottom of this function
+ * throws if export-time code accidentally enables it.
  */
 export function wrapSlideHtml(
   slideHtml: string,
   aspectRatio: AspectRatio,
-  options?: { inlineFontCss?: string }
+  options?: {
+    inlineFontCss?: string;
+    overrides?: CanvasOverrides | null;
+    editorRuntime?: boolean;
+  }
 ): string {
   const { width, height } = DIMENSIONS[aspectRatio];
-  const fontFamilies = extractFontFamilies(slideHtml);
+  // Apply overrides BEFORE we extract fonts so any new layer's font-family
+  // is picked up in the Google Fonts <link>.
+  const mergedHtml = options?.overrides
+    ? applyOverrides(slideHtml, options.overrides)
+    : slideHtml;
+  const fontFamilies = extractFontFamilies(mergedHtml);
 
   let fontBlock = "";
   if (options?.inlineFontCss) {
@@ -61,6 +80,16 @@ export function wrapSlideHtml(
     fontBlock = `<link href="https://fonts.googleapis.com/css2?${params}&display=swap" rel="stylesheet">`;
   }
 
+  // Phase 2: inject the editor runtime <script> when editorRuntime is true.
+  // Export call sites (`export-slides.ts`, `export-video.ts`) pass
+  // `editorRuntime: false` explicitly so PNG/MP4 output never bakes the
+  // runtime in. The runtime is the ONLY <script> tag we ever emit; if you
+  // see a `<script>` in export output, something is very wrong.
+  const wantsEditorRuntime = options?.editorRuntime === true;
+  const editorRuntimeBlock = wantsEditorRuntime
+    ? `\n  <script data-oc-editor-runtime="1">${EDITOR_RUNTIME_JS}</script>\n`
+    : "";
+
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -73,7 +102,7 @@ export function wrapSlideHtml(
   </style>
 </head>
 <body>
-  ${slideHtml}
+  ${mergedHtml}${editorRuntimeBlock}
 </body>
 </html>`;
 }

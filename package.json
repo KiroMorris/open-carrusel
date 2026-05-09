@@ -17,7 +17,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "doctor": "node scripts/doctor.mjs"
+    "doctor": "node scripts/doctor.mjs",
+    "build:editor-runtime": "node scripts/build-editor-runtime.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

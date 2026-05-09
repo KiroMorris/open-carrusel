@@ -1,7 +1,27 @@
 import { readDataSafe, writeData } from "./data";
 import { generateId, now } from "./utils";
-import type { Carousel, CarouselsData, Slide, AspectRatio, ReferenceImage } from "@/types/carousel";
+import type {
+  Carousel,
+  CarouselsData,
+  Slide,
+  AspectRatio,
+  ReferenceImage,
+  CanvasOverrides,
+  SlideVersion,
+} from "@/types/carousel";
 import { MAX_SLIDES, MAX_VERSIONS } from "@/types/carousel";
+
+/** Coerce a previousVersions entry (legacy string OR new object) into the
+ * structured shape. Use ONLY for reading; preserve raw entries on write so
+ * we don't rewrite legacy data unnecessarily. */
+function readVersionEntry(
+  entry: SlideVersion
+): { html: string; overrides: CanvasOverrides | null } {
+  if (typeof entry === "string") {
+    return { html: entry, overrides: null };
+  }
+  return { html: entry.html, overrides: entry.overrides ?? null };
+}
 
 const FILE = "carousels.json";
 
@@ -97,7 +117,8 @@ export async function deleteCarousel(id: string): Promise<boolean> {
 export async function addSlide(
   carouselId: string,
   html: string,
-  notes = ""
+  notes = "",
+  canvasOverrides: CanvasOverrides | null = null
 ): Promise<Slide | null> {
   const data = await load();
   const carousel = data.carousels.find((c) => c.id === carouselId);
@@ -110,6 +131,7 @@ export async function addSlide(
     previousVersions: [],
     order: carousel.slides.length,
     notes,
+    canvasOverrides,
   };
   carousel.slides.push(slide);
   carousel.updatedAt = now();
@@ -120,7 +142,7 @@ export async function addSlide(
 export async function updateSlide(
   carouselId: string,
   slideId: string,
-  updates: Partial<Pick<Slide, "html" | "notes">>
+  updates: Partial<Pick<Slide, "html" | "notes" | "canvasOverrides">>
 ): Promise<Slide | null> {
   const data = await load();
   const carousel = data.carousels.find((c) => c.id === carouselId);
@@ -128,15 +150,40 @@ export async function updateSlide(
   const slide = carousel.slides.find((s) => s.id === slideId);
   if (!slide) return null;
 
-  // Save current HTML to version history before overwriting
-  if (updates.html && updates.html !== slide.html) {
-    slide.previousVersions.push(slide.html);
+  // Save current state to version history when html changes. New entries
+  // capture both html AND overrides so undo restores the full canvas state.
+  if (updates.html !== undefined && updates.html !== slide.html) {
+    slide.previousVersions.push({
+      html: slide.html,
+      overrides: slide.canvasOverrides ?? null,
+    });
     if (slide.previousVersions.length > MAX_VERSIONS) {
       slide.previousVersions.shift();
     }
   }
 
   Object.assign(slide, updates);
+  carousel.updatedAt = now();
+  await save(data);
+  return slide;
+}
+
+/**
+ * Atomic override-only update. Skips html version-history thrashing during
+ * drag commits — the canvas editor pings this on every debounced change.
+ */
+export async function setCanvasOverrides(
+  carouselId: string,
+  slideId: string,
+  overrides: CanvasOverrides | null
+): Promise<Slide | null> {
+  const data = await load();
+  const carousel = data.carousels.find((c) => c.id === carouselId);
+  if (!carousel) return null;
+  const slide = carousel.slides.find((s) => s.id === slideId);
+  if (!slide) return null;
+
+  slide.canvasOverrides = overrides;
   carousel.updatedAt = now();
   await save(data);
   return slide;
@@ -194,8 +241,18 @@ export async function undoSlide(
   const slide = carousel.slides.find((s) => s.id === slideId);
   if (!slide || slide.previousVersions.length === 0) return null;
 
-  const previousHtml = slide.previousVersions.pop()!;
-  slide.html = previousHtml;
+  const previousEntry = slide.previousVersions.pop()!;
+  const restored = readVersionEntry(previousEntry);
+  slide.html = restored.html;
+  // Legacy string entries don't carry overrides — leaving the slide's
+  // current canvasOverrides in place would mis-pair them with the restored
+  // (older) html. Safer to clear in that case so the slide is in a known
+  // consistent state.
+  if (typeof previousEntry === "string") {
+    slide.canvasOverrides = null;
+  } else {
+    slide.canvasOverrides = restored.overrides;
+  }
   carousel.updatedAt = now();
   await save(data);
   return slide;

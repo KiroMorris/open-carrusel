@@ -51,3 +51,6 @@ open-carrusel*.log
 
 # OS
 Thumbs.db
+
+# Phase 6 visual-diff fixtures (do not commit)
+test-fixtures/

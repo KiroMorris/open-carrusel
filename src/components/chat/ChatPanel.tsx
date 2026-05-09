@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { ReferenceImages } from "./ReferenceImages";
-import { AlertCircle, Plug, ImagePlus, Plus, History, Trash2, X } from "lucide-react";
+import { AlertCircle, Plug, ImagePlus, Plus, History, Trash2, X, Lock } from "lucide-react";
 import type { ReferenceImage } from "@/types/carousel";
 
 interface ArchivedChat {
@@ -28,6 +28,17 @@ interface ChatPanelProps {
   onStreamStart?: () => void;
   onStreamEnd?: () => void;
   chatInputRef?: React.RefObject<HTMLTextAreaElement | null>;
+  /** Phase 5: when true, the active slide has non-empty canvasOverrides, so
+   *  Claude's PUT/DELETE will be rejected with HTTP 423. We surface a banner
+   *  above the input to warn the user before they send. */
+  activeSlideLocked?: boolean;
+  /** ID of the active slide — needed by the banner's "Unlock" button. */
+  activeSlideId?: string | null;
+  /** Active slide's 1-based number for display in the banner. */
+  activeSlideNumber?: number | null;
+  /** Called after the banner's "Unlock" button POSTs to the unlock endpoint
+   *  so the parent can refetch the carousel. */
+  onSlideUnlocked?: () => void;
 }
 
 export function ChatPanel({
@@ -37,6 +48,10 @@ export function ChatPanel({
   onStreamStart,
   onStreamEnd,
   chatInputRef,
+  activeSlideLocked = false,
+  activeSlideId = null,
+  activeSlideNumber = null,
+  onSlideUnlocked,
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -270,6 +285,26 @@ export function ChatPanel({
   const handleStopGenerating = useCallback(() => {
     abortRef.current?.abort();
   }, []);
+
+  // Phase 5: unlock the active slide from the chat banner. We default to
+  // keepText=true so the visual stays the same after the override metadata is
+  // baked into the HTML.
+  const [unlocking, setUnlocking] = useState(false);
+  const handleUnlockActiveSlide = useCallback(async () => {
+    if (!activeSlideId || unlocking) return;
+    setUnlocking(true);
+    try {
+      const res = await fetch(
+        `/api/carousels/${carouselId}/slides/${activeSlideId}/unlock?keepText=true`,
+        { method: "POST" }
+      );
+      if (res.ok) {
+        onSlideUnlocked?.();
+      }
+    } finally {
+      setUnlocking(false);
+    }
+  }, [activeSlideId, carouselId, onSlideUnlocked, unlocking]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -549,6 +584,28 @@ export function ChatPanel({
           </div>
         )}
       </div>
+
+      {/* Phase 5: locked-from-chat banner. Shown when the active slide has
+          non-empty canvasOverrides AND the user has at least one chat message
+          (so we don't pre-shame an empty session). */}
+      {activeSlideLocked && messages.length > 0 && (
+        <div className="mx-3 mb-2 flex items-start gap-2 text-[11px] bg-accent/10 border border-accent/30 rounded-md px-2.5 py-2">
+          <Lock className="h-3.5 w-3.5 shrink-0 mt-0.5" style={{ color: "var(--accent)" }} />
+          <div className="flex-1 leading-snug">
+            Slide{activeSlideNumber != null ? ` ${activeSlideNumber}` : ""} is locked from chat edits.{" "}
+            <button
+              type="button"
+              onClick={handleUnlockActiveSlide}
+              disabled={unlocking || !activeSlideId}
+              className="underline font-medium hover:no-underline disabled:opacity-50"
+              style={{ color: "var(--accent)" }}
+            >
+              {unlocking ? "Unlocking…" : "Unlock"}
+            </button>{" "}
+            it via the canvas toolbar to let Claude modify it.
+          </div>
+        </div>
+      )}
 
       <ChatInput
         onSend={handleSend}

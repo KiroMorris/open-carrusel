@@ -25,7 +25,10 @@ Use professional defaults: dark text on white/light backgrounds, Inter font, cle
 - Name: "${carousel.name}"
 - Aspect ratio: ${carousel.aspectRatio} (${DIMENSIONS[carousel.aspectRatio].width}x${DIMENSIONS[carousel.aspectRatio].height}px)
 - Slides: ${carousel.slides.length}/${MAX_SLIDES}
-${carousel.slides.length > 0 ? carousel.slides.map((s) => `  - Slide ${s.order + 1} (ID: ${s.id})${s.notes ? ` — ${s.notes}` : ""}`).join("\n") : "  (no slides yet)"}
+${carousel.slides.length > 0 ? carousel.slides.map((s) => {
+  const locked = !!s.canvasOverrides && Object.keys(s.canvasOverrides.layers).length > 0;
+  return `  - Slide ${s.order + 1} (ID: ${s.id})${locked ? " [LOCKED — user-refined in canvas, do not modify or delete]" : ""}${s.notes ? ` — ${s.notes}` : ""}`;
+}).join("\n") : "  (no slides yet)"}
 ${(carousel.referenceImages?.length ?? 0) > 0 ? `\n## Reference images (use Read to view these)\n${carousel.referenceImages.map((r) => `- "${r.name}" → ${r.absPath}`).join("\n")}` : ""}`
     : "";
 
@@ -160,11 +163,15 @@ After creating all slides, proactively offer to generate:
 2. 20-30 hashtags: mix of high-reach (500K+), medium (50K-500K), and niche (<50K)
 3. Save via PUT /api/carousels/{id}/caption
 
+## Locked slides
+Some slides above may be marked \`[LOCKED — user-refined in canvas, do not modify or delete]\`. The user has hand-refined those slides in the canvas editor. Do NOT update or delete locked slides — your \`curl\` PUT/DELETE will fail with HTTP 423 and the response body will include \`"code": "SLIDE_LOCKED"\`. If asked to change a locked slide, respond exactly: "Slide N is locked from canvas edits. Click 'Unlock' on the slide's refine toolbar to let me modify it." You CAN reference locked slides for context when designing new slides.
+
 ## Behavioral rules
 - BE PROACTIVE: Create first, refine later. Never ask for permission to start creating.
 - ONE SLIDE AT A TIME: Create slides sequentially so the user sees progress
 - BRIEF RESPONSES: After creating slides, describe what you made in 1-2 sentences
 - BRAND CONSISTENCY: Use brand colors, fonts, and style across every slide
 - CREATIVE VARIETY: Vary slide layouts — don't repeat the same layout for every slide
-- ALWAYS END WITH CTA: The last slide should always have a call-to-action`;
+- ALWAYS END WITH CTA: The last slide should always have a call-to-action
+- RESPECT LOCKS: Never attempt to PUT or DELETE a slide flagged \`[LOCKED]\` above`;
 }

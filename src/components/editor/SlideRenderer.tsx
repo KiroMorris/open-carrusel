@@ -2,7 +2,7 @@
 
 import { useMemo, useRef, useEffect, useState, useCallback } from "react";
 import { wrapSlideHtml } from "@/lib/slide-html";
-import type { AspectRatio } from "@/types/carousel";
+import type { AspectRatio, CanvasOverrides } from "@/types/carousel";
 import { DIMENSIONS } from "@/types/carousel";
 
 interface SlideRendererProps {
@@ -10,6 +10,8 @@ interface SlideRendererProps {
   aspectRatio: AspectRatio;
   className?: string;
   style?: React.CSSProperties;
+  /** Canvas refine-mode overrides; preview matches export when supplied. */
+  overrides?: CanvasOverrides | null;
 }
 
 export function SlideRenderer({
@@ -17,14 +19,15 @@ export function SlideRenderer({
   aspectRatio,
   className,
   style,
+  overrides,
 }: SlideRendererProps) {
   const outerRef = useRef<HTMLDivElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
   const { width: slideW, height: slideH } = DIMENSIONS[aspectRatio];
 
   const srcDoc = useMemo(
-    () => wrapSlideHtml(html, aspectRatio),
-    [html, aspectRatio]
+    () => wrapSlideHtml(html, aspectRatio, { overrides: overrides ?? null }),
+    [html, aspectRatio, overrides]
   );
 
   const measure = useCallback(() => {

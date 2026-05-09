@@ -5,7 +5,9 @@ import { ChevronLeft, ChevronRight, Download, Film } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SlideRenderer } from "./SlideRenderer";
 import { SafeZoneOverlay } from "./SafeZoneOverlay";
-import type { Slide, AspectRatio } from "@/types/carousel";
+import { CanvasEditor } from "./canvas/CanvasEditor";
+import { RefineModeToggle } from "./canvas/RefineModeToggle";
+import type { Slide, AspectRatio, CanvasOverrides } from "@/types/carousel";
 
 interface CarouselPreviewProps {
   slides: Slide[];
@@ -14,6 +16,10 @@ interface CarouselPreviewProps {
   onActiveChange: (index: number) => void;
   showSafeZones?: boolean;
   carouselId?: string;
+  mode?: "preview" | "refine";
+  onModeChange?: (next: "preview" | "refine") => void;
+  /** Notified when the canvas editor commits new overrides for a slide. */
+  onOverridesChange?: (slideId: string, overrides: CanvasOverrides | null) => void;
 }
 
 export function CarouselPreview({
@@ -23,6 +29,9 @@ export function CarouselPreview({
   onActiveChange,
   showSafeZones = false,
   carouselId,
+  mode = "preview",
+  onModeChange,
+  onOverridesChange,
 }: CarouselPreviewProps) {
   const [downloading, setDownloading] = useState(false);
   const [downloadingVideo, setDownloadingVideo] = useState(false);
@@ -117,6 +126,22 @@ export function CarouselPreview({
     );
   }
 
+  // Refine mode swaps the read-only renderer for the canvas editor. We keep
+  // the surrounding chrome (arrows, dots, download buttons) hidden in refine
+  // mode so the editor owns the full preview surface.
+  if (mode === "refine" && carouselId) {
+    return (
+      <CanvasEditor
+        carouselId={carouselId}
+        slideId={slide.id}
+        html={slide.html}
+        aspectRatio={aspectRatio}
+        initialOverrides={slide.canvasOverrides ?? null}
+        onOverridesChange={(o) => onOverridesChange?.(slide.id, o)}
+      />
+    );
+  }
+
   return (
     <div className="flex-1 flex flex-col min-h-0 min-w-0 bg-[#f0f0f0]">
       {/* Preview area with padding for arrows */}
@@ -142,6 +167,7 @@ export function CarouselPreview({
           <SlideRenderer
             html={slide.html}
             aspectRatio={aspectRatio}
+            overrides={slide.canvasOverrides ?? null}
             style={{ width: "100%", height: "100%" }}
           />
           <SafeZoneOverlay aspectRatio={aspectRatio} visible={showSafeZones} />
@@ -158,6 +184,17 @@ export function CarouselPreview({
         >
           <ChevronRight className="h-4 w-4" />
         </Button>
+
+        {/* Refine mode toggle — hidden when no slide / no carousel */}
+        {carouselId && onModeChange && (
+          <div className="absolute top-3 left-14 z-10">
+            <RefineModeToggle
+              mode={mode}
+              onToggle={onModeChange}
+              overrides={slide.canvasOverrides ?? null}
+            />
+          </div>
+        )}
 
         {/* Download this slide (PNG) */}
         {carouselId && (

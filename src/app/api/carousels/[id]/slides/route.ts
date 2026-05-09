@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { addSlide, reorderSlides, getCarousel } from "@/lib/carousels";
+import type { CanvasOverrides } from "@/types/carousel";
 
 export async function POST(
   request: Request,
@@ -8,7 +9,11 @@ export async function POST(
   const { id } = await params;
   try {
     const body = await request.json();
-    const { html, notes } = body as { html?: string; notes?: string };
+    const { html, notes, canvasOverrides } = body as {
+      html?: string;
+      notes?: string;
+      canvasOverrides?: CanvasOverrides | null;
+    };
 
     if (!html || typeof html !== "string") {
       return NextResponse.json(
@@ -17,7 +22,7 @@ export async function POST(
       );
     }
 
-    const slide = await addSlide(id, html, notes);
+    const slide = await addSlide(id, html, notes, canvasOverrides ?? null);
     if (!slide) {
       return NextResponse.json(
         { error: "Carousel not found or max slides reached" },

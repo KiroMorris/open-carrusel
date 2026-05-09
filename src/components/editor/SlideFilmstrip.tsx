@@ -1,6 +1,6 @@
 "use client";
 
-import { Plus, Trash2, Undo2, GripVertical } from "lucide-react";
+import { Plus, Trash2, Undo2, GripVertical, Lock } from "lucide-react";
 import {
   DndContext,
   closestCenter,
@@ -139,6 +139,20 @@ function SortableSlideThumb({
       <div className="absolute bottom-1 left-1 text-[9px] font-bold text-white bg-black/60 rounded px-1 py-0.5 leading-none">
         {index + 1}
       </div>
+
+      {/* Phase 5 lock badge — slide has non-empty canvasOverrides, so it is
+          locked from chat edits. */}
+      {slide.canvasOverrides &&
+        Object.keys(slide.canvasOverrides.layers).length > 0 && (
+          <div
+            className="absolute top-1 right-1 h-4 w-4 rounded-full bg-white shadow-sm border border-border flex items-center justify-center"
+            style={{ color: "var(--accent)" }}
+            title="Locked — refined in canvas, chat cannot edit this slide"
+            aria-label="Slide locked from chat edits"
+          >
+            <Lock className="h-2.5 w-2.5" />
+          </div>
+        )}
     </div>
   );
 }

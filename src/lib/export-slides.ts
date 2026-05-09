@@ -77,9 +77,13 @@ export async function exportSlide(
   // Inline images
   const inlinedHtml = await inlineImages(slide.html);
 
-  // Build self-contained HTML
+  // Build self-contained HTML. We pass canvasOverrides through so the merged
+  // PNG matches the preview/refine view byte-for-byte. editorRuntime is
+  // explicitly false — Puppeteer must NEVER execute the editor script.
   const fullHtml = wrapSlideHtml(inlinedHtml, aspectRatio, {
     inlineFontCss: inlinedFontCss,
+    overrides: slide.canvasOverrides ?? null,
+    editorRuntime: false,
   });
 
   const br = await getBrowser();

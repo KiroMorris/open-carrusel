@@ -76,8 +76,13 @@ export async function exportSlideVideo(
   const fontFamilies = extractFontFamilies(slide.html);
   const inlinedFontCss = await getInlinedFontCSS(fontFamilies);
   const inlinedHtml = await inlineImages(slide.html);
+  // editorRuntime explicitly false — the MP4 pipeline records what the user
+  // sees, not the editor chrome. canvasOverrides flow through so refined
+  // slides record at their refined positions.
   const fullHtml = wrapSlideHtml(inlinedHtml, aspectRatio, {
     inlineFontCss: inlinedFontCss,
+    overrides: slide.canvasOverrides ?? null,
+    editorRuntime: false,
   });
 
   const browser = await getBrowser();
