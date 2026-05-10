@@ -660,6 +660,27 @@ function isShapeLayer(el: Element): boolean {
       if (t.length > 0) return false;
     }
   }
+  // CRITICAL — don't claim containers that wrap other selectable elements.
+  // E.g. `<div class="pair"><img><img></div>` should NOT register as a shape;
+  // the two `<img>`s are individually selectable image-frames. Tagging the
+  // pair as a shape would absorb every click on either child.
+  // Same for any container whose descendants include a non-text element
+  // bigger than say 20px — assume there's something inside the user might
+  // want to select individually.
+  const kids = el.querySelectorAll("img, svg, video, iframe, embed");
+  if (kids.length > 0) return false;
+  // Also reject if it has any block-level child div/section/etc. that's
+  // visually substantial — those are likely to be their own shapes or
+  // contain text leaves.
+  const childEls = el.children;
+  for (let i = 0; i < childEls.length; i++) {
+    const c = childEls[i];
+    const ctag = c.tagName.toLowerCase();
+    if (ctag === "div" || ctag === "section" || ctag === "article" || ctag === "aside" || ctag === "header" || ctag === "footer" || ctag === "main" || ctag === "nav") {
+      const cr = (c as HTMLElement).getBoundingClientRect();
+      if (cr.width > 20 && cr.height > 20) return false;
+    }
+  }
   const r = (el as HTMLElement).getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return false;
   const cs = getComputedStyle(el as HTMLElement);
@@ -1849,12 +1870,19 @@ function onPointerDown(ev: PointerEvent): void {
     clientY: ev.clientY,
     modifiers: modsFromEvent(ev),
   });
-  // Track for double-click detection (text layers only).
+  // Track for double-click detection. Tightened to 250ms (BUG-010 lineage)
+  // and only auto-enter inline edit if the layer is actually a text layer.
+  // Image frames need the dblclick to reach the parent (which dispatches
+  // enterInsideFrame) WITHOUT putting the frame into contenteditable mode.
   const now = Date.now();
-  if (id && lastDownTargetId === id && now - lastDownTimestamp < 350) {
+  if (id && lastDownTargetId === id && now - lastDownTimestamp < 250) {
     postToParent("oc:editor:dblclick-text", { id: id });
-    // Auto-enter inline edit mode so typing works immediately.
-    enterInlineEdit(id);
+    // Only auto-enter inline edit for text layers. Image frames dispatch
+    // enterInsideFrame on the parent side; calling enterInlineEdit on a
+    // frame would mistakenly make it contenteditable.
+    if (layerById.has(id)) {
+      enterInlineEdit(id);
+    }
     lastDownTimestamp = 0;
     lastDownTargetId = null;
   } else {
