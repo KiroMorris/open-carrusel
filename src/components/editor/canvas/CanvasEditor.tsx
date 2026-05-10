@@ -1066,12 +1066,46 @@ export function CanvasEditor({
   };
 
   // Phase 4 — derive layer roster + per-id labels for LayersPanel.
+  // The Layers panel + selection lookups need to know about ALL text-leaves
+  // the runtime tagged in the iframe — not just ones the user has actively
+  // edited. We merge the runtime's layout list with any per-id overrides
+  // (overrides win for transform/style; layout supplies the seed for the rest).
   const allLayersInOrder: CanvasLayer[] = useMemo(() => {
-    if (!overrides) return [];
-    return overrides.order
-      .map((id) => overrides.layers[id])
-      .filter((l): l is CanvasLayer => !!l);
-  }, [overrides]);
+    const seen = new Set<string>();
+    const out: CanvasLayer[] = [];
+    // Runtime-detected layers come first (Claude's authored order).
+    for (const m of layout) {
+      const ovr = overrides?.layers[m.id];
+      if (ovr) {
+        out.push(ovr);
+      } else {
+        out.push({
+          id: m.id,
+          kind: m.kind,
+          transform: {
+            x: m.rect.x,
+            y: m.rect.y,
+            w: m.rect.w,
+            h: m.rect.h,
+            rotation: 0,
+            z: 0,
+          },
+          style: {},
+        });
+      }
+      seen.add(m.id);
+    }
+    // Then any override-only layers (newly added via T key, etc.) the runtime
+    // hasn't reported yet via layout.
+    if (overrides) {
+      for (const id of overrides.order) {
+        if (seen.has(id)) continue;
+        const l = overrides.layers[id];
+        if (l) out.push(l);
+      }
+    }
+    return out;
+  }, [overrides, layout]);
 
   const selectedLayers: CanvasLayer[] = useMemo(() => {
     return selectedIds
