@@ -577,9 +577,16 @@ function detectImageFrame(img: HTMLImageElement): DetectedImageFrame {
       return { source: "parent", frameEl: parent as HTMLElement, innerEl: img };
     }
   }
-  // Wrap path. Capture the `<img>`'s pre-mutation visual rect off its
-  // computed style so the wrapper inherits the same in-flow position.
+  // Wrap path. Capture the `<img>`'s pre-mutation visual rect AND its
+  // computed style so the wrapper inherits the same visual footprint.
+  //
+  // We read the BOUNDING-RECT pixels (not `cs.width`/`cs.height`) for the
+  // wrapper because the `<img>` was likely sized by a parent selector
+  // (e.g. `.pair img { width:100%; height:100% }`) that no longer matches
+  // the wrapper after we splice it in. Using pixels guarantees the wrapper
+  // stays the same size as the image was, regardless of CSS context.
   const cs = getComputedStyle(img);
+  const visualRect = img.getBoundingClientRect();
   const wrap = document.createElement("div");
   wrap.setAttribute("data-oc-image-wrap", "1");
   wrap.style.position = cs.position === "static" ? "relative" : cs.position;
@@ -587,10 +594,26 @@ function detectImageFrame(img: HTMLImageElement): DetectedImageFrame {
   if (cs.left !== "auto") wrap.style.left = cs.left;
   if (cs.right !== "auto") wrap.style.right = cs.right;
   if (cs.bottom !== "auto") wrap.style.bottom = cs.bottom;
-  wrap.style.width = cs.width;
-  wrap.style.height = cs.height;
+  // Pixel-locked size so we don't depend on parent selectors that no longer
+  // match the wrapper. Fallback to the computed CSS string only when the
+  // bounding rect is zero (image not yet laid out — Pass A's load-listener
+  // path will retry).
+  if (visualRect.width > 0 && visualRect.height > 0) {
+    wrap.style.width = `${visualRect.width}px`;
+    wrap.style.height = `${visualRect.height}px`;
+  } else {
+    wrap.style.width = cs.width;
+    wrap.style.height = cs.height;
+  }
   wrap.style.margin = cs.margin;
+  wrap.style.padding = "0";
+  wrap.style.border = "0";
+  wrap.style.boxSizing = "border-box";
   wrap.style.overflow = "hidden";
+  // Some authored layouts use flex on the parent with the `<img>` as a flex
+  // child sized via `flex: 1` or `align-self: stretch`. The wrapper inherits
+  // none of that — it needs `flex-shrink: 0` so it doesn't collapse.
+  wrap.style.flexShrink = "0";
   if (cs.borderRadius && cs.borderRadius !== "0px") {
     wrap.style.borderRadius = cs.borderRadius;
   }
