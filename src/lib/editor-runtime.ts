@@ -232,6 +232,10 @@ interface ImageEntry {
   rect: Rect;
   /** Has any user-driven transform actually been committed? */
   applied?: boolean;
+  /** True if `source: "wrapped"` was speculative — the actual DOM wrap
+   * mutation is deferred until the user makes their first edit, so refine
+   * mode doesn't visually disrupt the slide on entry. */
+  pendingWrap?: boolean;
 }
 
 interface ShapeEntry {
@@ -798,45 +802,53 @@ function runImageShapeDetection(): void {
     const isTopLevelImg = !path.includes(">");
     let detected: DetectedImageFrame;
     // Capture the FRAME's natural rect BEFORE any mutation.
-    let preFrameRect: { x: number; y: number; w: number; h: number };
-    if (isTopLevelImg) {
-      // Force wrapped. Pre-rect is the <img>'s own rect.
-      const r = img.getBoundingClientRect();
-      preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
-      detected = detectImageFrame(img);
-      // detectImageFrame above wraps unconditionally because parent (body)
-      // doesn't satisfy isOnlyVisualChild + overflow:hidden. Good.
-    } else {
-      // Pre-detection: speculatively decide if we'll reuse parent or wrap.
-      // Either way we want preFrameRect = the FRAME element's pre-mutation
-      // rect, so peek at the heuristic without mutating.
-      const parent = img.parentElement;
-      const parentCs = parent ? getComputedStyle(parent) : null;
-      const parentQualifies =
-        !!parent &&
-        parent !== document.body &&
-        !!parentCs &&
-        (parentCs.overflow === "hidden" ||
-          parentCs.overflowX === "hidden" ||
-          parentCs.overflowY === "hidden") &&
-        isOnlyVisualChild(parent, img);
-      const futureFrameEl = parentQualifies ? (parent as HTMLElement) : img;
-      const r = futureFrameEl.getBoundingClientRect();
-      preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
-      detected = detectImageFrame(img);
-    }
+    //
+    // KEY DECISION (BUG-202 hardening): we DO NOT wrap the <img> at boot.
+    // Wrapping always risks visual regression because Claude's selectors
+    // (`.pair img { width:100% }` etc.) target the <img>, not a wrapper.
+    // Instead we:
+    //   1. Speculatively decide which strategy we'll use AT EDIT TIME.
+    //   2. Register the entry with `frameEl: img` and a `pendingWrap` flag.
+    //   3. Hit-test off the <img>'s own rect.
+    //   4. When the parent first edits this image (apply-image-transform),
+    //      we materialize the wrapper at that moment.
+    // Net effect: entering refine mode is now visually identical to preview.
+    const parent = img.parentElement;
+    const parentCs = parent ? getComputedStyle(parent) : null;
+    const parentQualifies =
+      !isTopLevelImg &&
+      !!parent &&
+      parent !== document.body &&
+      !!parentCs &&
+      (parentCs.overflow === "hidden" ||
+        parentCs.overflowX === "hidden" ||
+        parentCs.overflowY === "hidden") &&
+      isOnlyVisualChild(parent, img);
+    const speculativeFrameEl: HTMLElement = parentQualifies
+      ? (parent as HTMLElement)
+      : img;
+    const r = speculativeFrameEl.getBoundingClientRect();
+    const preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    // For BOOT we use the speculative frame element as-is (no wrap, no
+    // parent-overflow mutation). The first edit triggers materialize.
+    const speculativeSource: "wrapped" | "parent" = parentQualifies
+      ? "parent"
+      : "wrapped";
+    detected = {
+      source: speculativeSource,
+      frameEl: speculativeFrameEl,
+      innerEl: img,
+    };
     if (!tryClaim(detected.frameEl, "image")) {
       // Some other pass beat us — bail (shouldn't happen since image runs first).
       continue;
     }
-    // Compute initial cover-fit calibration.
+    // Compute initial cover-fit calibration. We DON'T apply it visually at
+    // boot — the original DOM is already showing the right pixels (whether
+    // via object-fit:cover or background-size:cover). Calibration is stored
+    // for use when the user makes their first edit.
     const natural = { w: img.naturalWidth, h: img.naturalHeight };
     const inner = coverFitCalibration(natural, preFrameRect);
-    // Apply initial calibration to the inner image (wrapped path needs it
-    // because we just reset the `<img>` to absolute fill; without the
-    // transform the user would see the natural-size image at top-left).
-    detected.innerEl.style.transform = innerImageTransformString(inner);
-    detected.innerEl.style.transformOrigin = "0 0";
     const entry: ImageEntry = {
       id: id,
       frameEl: detected.frameEl,
@@ -844,6 +856,8 @@ function runImageShapeDetection(): void {
       source: detected.source,
       natural: natural,
       naturalFrameRect: preFrameRect,
+      // Mark that the actual wrap mutation hasn't run yet.
+      pendingWrap: speculativeSource === "wrapped",
       frame: {
         x: preFrameRect.x,
         y: preFrameRect.y,
@@ -1378,6 +1392,27 @@ function applyImageFrameTransform(
 ): void {
   const entry = imageById.get(id);
   if (!entry) return;
+  // Materialize the deferred wrap on first apply. Until this runs the entry's
+  // `frameEl` is the original `<img>` and the DOM is byte-identical to
+  // preview. After this runs we can apply transforms safely.
+  if (entry.pendingWrap && entry.innerEl) {
+    const detected = detectImageFrame(entry.innerEl);
+    entry.frameEl = detected.frameEl;
+    entry.innerEl = detected.innerEl;
+    entry.source = detected.source;
+    entry.pendingWrap = false;
+    // Re-tag the new frame element with the layer id + claim attr so
+    // hit-test + future restore works.
+    entry.frameEl.setAttribute("data-oc-layer-id", id);
+    entry.frameEl.setAttribute("data-oc-runtime-claimed", "image");
+    // Apply the cover-fit calibration NOW (we deferred it at boot).
+    const inner = coverFitCalibration(entry.natural, entry.naturalFrameRect);
+    entry.image = inner;
+    if (entry.innerEl) {
+      entry.innerEl.style.transform = innerImageTransformString(inner);
+      entry.innerEl.style.transformOrigin = "0 0";
+    }
+  }
   const close = (a: number | null | undefined, b: number): boolean => {
     if (a == null) return true;
     return Math.abs(a - b) <= 1;
