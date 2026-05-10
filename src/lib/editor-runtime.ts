@@ -162,6 +162,13 @@ interface LayerEntry {
   /** True if user has activated inline edit mode (contenteditable). */
   editing?: boolean;
   /**
+   * The element's measured rect at first contact, BEFORE any override-driven
+   * translate was applied. Used by `applyTransform` to compute the dx/dy
+   * delta from the natural slot — so `transform: translate()` keeps the
+   * element in normal flow while still moving visually.
+   */
+  naturalRect?: Rect;
+  /**
    * True once the runtime has actually committed a positional override
    * (position:absolute + left/top/etc) to this element. Until then,
    * `applyTransform` calls that match the cached rect within ~1px are
@@ -455,77 +462,97 @@ interface AppliedTransform {
  *   - `z-index` is only set when `t.z != null`. Callers passing `null`/
  *     `undefined` won't drop the layer into a sibling's stacking order.
  */
+/**
+ * Original-flow movement strategy (BUG-009 fix):
+ *
+ * The previous design absolutized the element with `position:absolute; left/top`
+ * the moment the user committed a positional override. That was lethal for
+ * flex/grid children and absolutely-positioned wrappers — leaving the
+ * document flow collapsed siblings up into the layer's vacated slot, AND the
+ * `left/top` coordinates resolved against the WRONG containing block.
+ *
+ * New strategy: keep the element in normal flow. Apply visual movement via
+ * `transform: translate(dx, dy) [scale(...)] [rotate(...)]`. The original
+ * layout slot stays reserved (siblings don't collapse), and the translate is
+ * always relative to the element's natural position — independent of what
+ * containing block CSS resolves it against.
+ *
+ * Width/height resize is more invasive (changes layout box). For v1 we
+ * accept that: any non-trivial resize sets w/h directly. Sibling reflow on
+ * resize is acceptable because resize is rare; movement is the common case.
+ *
+ * `entry.naturalRect` caches the element's measured rect at first contact,
+ * so dx/dy = (override.x - naturalRect.x), etc. This is the only safe way to
+ * apply translate without snapping the element to the slide origin.
+ */
 function applyTransform(id: string, t: AppliedTransform): void {
   const entry = layerById.get(id);
   if (!entry) return;
   const el = entry.el;
 
-  // No-op detection: if the override carries no positional fields at all,
-  // skip the positional block entirely. (Style-only overrides still want
-  // z-index updates handled below.)
+  // Capture the natural (un-overridden) rect on first apply so future
+  // translate calls always know where the element naturally lives.
+  if (!entry.naturalRect) {
+    entry.naturalRect = { ...entry.rect };
+  }
+
   const hasPositional =
     t.x != null || t.y != null || t.w != null || t.h != null;
 
   if (hasPositional) {
-    // Idempotent skip: if the element has never been absolutized AND every
-    // supplied positional field already matches the cached rect within 1px,
-    // do nothing. This is the seeded-snapshot replay path that used to
-    // corrupt flex/grid children.
-    if (!entry.absolutized) {
-      const cur = entry.rect;
-      const close = (a: number | null | undefined, b: number): boolean => {
-        if (a == null) return true;
-        return Math.abs(a - b) <= 1;
-      };
-      const matchesRect =
-        close(t.x, cur.x) &&
-        close(t.y, cur.y) &&
-        close(t.w, cur.w) &&
-        close(t.h, cur.h);
-      if (matchesRect) {
-        // Pure no-op for positional fields. Still apply z-index and
-        // rotation below if the caller meant to nudge those.
-      } else {
-        // The user has actually moved/resized. Commit to canvas-positioning.
-        el.style.position = "absolute";
-        if (t.x != null) el.style.left = t.x + "px";
-        if (t.y != null) el.style.top = t.y + "px";
-        if (t.w != null) el.style.width = t.w + "px";
-        if (t.h != null) el.style.height = t.h + "px";
-        entry.absolutized = true;
-      }
-    } else {
-      // Already absolutized — re-apply faithfully.
-      el.style.position = "absolute";
-      if (t.x != null) el.style.left = t.x + "px";
-      if (t.y != null) el.style.top = t.y + "px";
-      if (t.w != null) el.style.width = t.w + "px";
-      if (t.h != null) el.style.height = t.h + "px";
-    }
-  }
+    const natural = entry.naturalRect;
+    const close = (a: number | null | undefined, b: number): boolean => {
+      if (a == null) return true;
+      return Math.abs(a - b) <= 1;
+    };
+    const matchesNatural =
+      close(t.x, natural.x) &&
+      close(t.y, natural.y) &&
+      close(t.w, natural.w) &&
+      close(t.h, natural.h);
 
-  // Rotation: only touch `el.style.transform` when a meaningful rotation
-  // was supplied. Skipping the 0/undefined case preserves authored
-  // `transform: translate(...)` (centering tricks) and CSS animations
-  // (e.g. `.swipe .ar { animation: nudge ...; }`).
-  if (t.rotation != null && t.rotation !== 0) {
+    if (!matchesNatural) {
+      // Compute the translate delta from the natural slot.
+      const dx = (t.x != null ? t.x : natural.x) - natural.x;
+      const dy = (t.y != null ? t.y : natural.y) - natural.y;
+      // Build the transform string. We may need to mix in rotation below.
+      const transforms: string[] = [];
+      if (dx !== 0 || dy !== 0) {
+        transforms.push("translate(" + dx + "px," + dy + "px)");
+      }
+      if (t.rotation != null && t.rotation !== 0) {
+        transforms.push("rotate(" + t.rotation + "deg)");
+      }
+      if (transforms.length > 0) {
+        el.style.transform = transforms.join(" ");
+      } else {
+        // Both dx/dy are 0 and no rotation — clear our override.
+        el.style.transform = "";
+      }
+      // Resize: only set explicit width/height when the user truly resized.
+      // We can't usefully translate-resize text content; set the box dims
+      // directly. This may trigger sibling reflow on resize-only edits.
+      if (t.w != null && Math.abs(t.w - natural.w) > 1) {
+        el.style.width = t.w + "px";
+      }
+      if (t.h != null && Math.abs(t.h - natural.h) > 1) {
+        el.style.height = t.h + "px";
+      }
+      entry.absolutized = true; // "we have applied an override" — kept for code-path symmetry
+    }
+    // matchesNatural === true → pure no-op replay; do nothing.
+  } else if (t.rotation != null && t.rotation !== 0) {
+    // No positional change but rotation was supplied: just set rotate.
     el.style.transform = "rotate(" + t.rotation + "deg)";
   }
 
-  // z-index: only when the caller actually set it. Don't default to 0.
   if (t.z != null) el.style.zIndex = String(t.z);
 
-  // Visibility: only re-show if currently hidden. Never set unconditionally.
-  // (Replicas already had visibility:visible !important pinned in
-  // tagAndMeasureLayers; this branch covers a future case where another
-  // override toggled it.)
   if (el.style.visibility === "hidden") {
     el.style.visibility = "visible";
   }
 
-  // Refresh cached rect so subsequent hit-tests see the new position.
-  // Use the Range-based measurement to match `tagAndMeasureLayers`'s
-  // tight-glyph bounds (BUG-012 / BUG-003 hygiene).
+  // Refresh cached rect for hit-testing against the NEW visual position.
   entry.rect = measureTextRect(el);
 }
 
