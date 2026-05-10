@@ -98,6 +98,12 @@ interface InspectorProps {
   onSelectLayer?: (id: string, additive: boolean) => void;
   onDeleteLayer?: (id: string) => void;
   onZOrderLayer?: (id: string, direction: ZDirection) => void;
+  /** True when the slide has any persisted overrides — controls whether the
+   *  "Reset slide" action is available. */
+  hasOverrides?: boolean;
+  /** Wipes ALL canvas overrides for this slide and reverts the iframe to
+   *  Claude's original HTML. Confirmed via window.confirm before firing. */
+  onResetSlide?: () => void;
   className?: string;
 }
 
@@ -112,11 +118,24 @@ export function Inspector({
   onSelectLayer,
   onDeleteLayer,
   onZOrderLayer,
+  hasOverrides,
+  onResetSlide,
   className,
 }: InspectorProps) {
   const [showSwatches, setShowSwatches] = useState(false);
   const multi = (selectedLayers?.length ?? 0) > 1;
   const sharedStyle = multi ? sharedStyleFor(selectedLayers!) : layer?.style ?? null;
+
+  const handleReset = () => {
+    if (!onResetSlide) return;
+    if (
+      window.confirm(
+        "Discard ALL canvas edits on this slide and revert to the original?\n\nThis cannot be undone."
+      )
+    ) {
+      onResetSlide();
+    }
+  };
 
   if (!layer) {
     return (
@@ -126,10 +145,20 @@ export function Inspector({
           className
         )}
       >
-        <div className="px-4 py-3 border-b border-border">
+        <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-2">
           <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Inspector
           </div>
+          {hasOverrides && onResetSlide && (
+            <button
+              type="button"
+              onClick={handleReset}
+              className="text-[10px] text-muted-foreground hover:text-destructive uppercase tracking-wider px-2 py-0.5 rounded border border-border hover:border-destructive transition-colors"
+              title="Discard all canvas edits and revert this slide"
+            >
+              Reset slide
+            </button>
+          )}
         </div>
         <div className="p-4 text-xs text-muted-foreground">
           Select a layer to edit its style.
@@ -168,12 +197,24 @@ export function Inspector({
       )}
     >
       <div className="px-4 py-3 border-b border-border">
-        <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          Inspector
-          {multi && (
-            <span className="ml-2 text-[10px] normal-case font-normal text-accent">
-              {selectedLayers!.length} selected
-            </span>
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Inspector
+            {multi && (
+              <span className="ml-2 text-[10px] normal-case font-normal text-accent">
+                {selectedLayers!.length} selected
+              </span>
+            )}
+          </div>
+          {hasOverrides && onResetSlide && (
+            <button
+              type="button"
+              onClick={handleReset}
+              className="text-[10px] text-muted-foreground hover:text-destructive uppercase tracking-wider px-2 py-0.5 rounded border border-border hover:border-destructive transition-colors"
+              title="Discard all canvas edits and revert this slide"
+            >
+              Reset slide
+            </button>
           )}
         </div>
         <div className="text-[10px] text-muted-foreground mt-0.5 truncate" title={layer.id}>

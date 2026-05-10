@@ -1,5 +1,5 @@
 /**
- * Editor runtime — Phase 2.
+ * Editor runtime — Phase 4 (BUG-003 / BUG-004 hardening).
  *
  * This module is COMPILED to a plain-JS string by `scripts/build-editor-runtime.mjs`
  * and injected verbatim inside an inline `<script>` tag by `wrapSlideHtml()`
@@ -9,14 +9,34 @@
  * Constraints:
  *   - No imports. No `import type`. No external deps. Plain TS subset that the
  *     hand-rolled stripper in `scripts/build-editor-runtime.mjs` understands.
- *   - Stays small (~250 lines). Phase 3 will pile features on top of this.
+ *   - Stays small. Phase 4 added idempotent applyTransform and replica/original
+ *     id-collision avoidance.
  *
  * Parity requirement (CRITICAL — read before changing):
  *   - `hashLayerId()` below MUST stay byte-stable with `hashLayerId()` in
  *     `src/lib/canvas-overrides.ts`. They use the same cyrb53 + normalize
  *     pipeline. If you change one, you MUST change the other or every
  *     persisted override gets orphaned silently.
+ *
+ * Contract with `src/lib/canvas-overrides.ts` (BUG-004 fix):
+ *   - Replica elements emitted by `applyOverrides` MUST be marked with the
+ *     attribute `data-oc-layer-kind` (value "existing" or "new"). The runtime
+ *     uses presence of this attribute to distinguish a server-emitted replica
+ *     from a Claude-authored element. Replicas keep their pre-set
+ *     `data-oc-layer-id`; the runtime never re-hashes their id.
+ *   - For text-edited "existing" layers, `applyOverrides` injects a
+ *     visibility:hidden CSS rule keyed on `data-oc-layer-id`. That rule will
+ *     ALSO match the replica because the replica carries the same id. The
+ *     runtime works around this by force-applying `visibility: visible` as an
+ *     INLINE style on every replica at boot (inline beats stylesheet
+ *     specificity). To make this less hacky, canvas-overrides.ts SHOULD make
+ *     its hide-rule selector specific to non-replicas:
+ *         `[data-oc-layer-id="X"]:not([data-oc-layer-kind]){visibility:hidden}`
+ *     Until that lands, the runtime's inline override keeps the replica
+ *     visible.
  */
+
+const RUNTIME_VERSION = "phase-4-bug-003-004";
 
 // --- Inlined hash (mirror of src/lib/canvas-overrides.ts) -------------------
 
@@ -40,11 +60,13 @@ function normalizeText(text: string): string {
   return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-function hashLayerId(tag: string, cssPath: string, normalizedText: string): string {
+function hashLayerId(tag: string, cssPath: string, _normalizedText?: string): string {
+  // Text is intentionally NOT part of the hash — otherwise editing a layer's
+  // text would change its id and orphan the persisted override. Keep the
+  // signature for API back-compat with existing call sites.
   const t = (tag || "").toLowerCase();
   const p = cssPath || "";
-  const x = normalizeText(normalizedText || "");
-  return "oc-" + hash53(t + "|" + p + "|" + x);
+  return "oc-" + hash53(t + "|" + p);
 }
 
 // --- DOM walking -------------------------------------------------------------
@@ -81,27 +103,46 @@ function cssPathOf(el: Element): string {
   return parts.join(">");
 }
 
+// Inline-formatting tags that don't break a "text-leaf".
+const INLINE_TEXT_TAGS = new Set([
+  "span", "br", "em", "strong", "b", "i", "u",
+  "small", "sup", "sub", "mark", "code", "kbd", "abbr", "wbr",
+]);
+
 /**
- * Heuristic: a "text-bearing leaf" is any element whose own non-whitespace
- * text content is exactly the concatenation of its direct child text nodes
- * (i.e. it doesn't have child elements that themselves carry their own text).
- * That keeps us from tagging container `<div>`s that wrap their own text
- * children, while still catching `<h1>`, `<p>`, `<span>` style leaves.
+ * Heuristic: a "text-bearing leaf" is any element that
+ *   1. has its OWN direct non-whitespace text content (not just text from
+ *      descendants — the element itself must contain a text Node directly),
+ *   2. has NO block-level child elements,
+ *   3. has measurable visual bounds (skips zero-area / off-screen wrappers).
+ *
+ * The "own direct text" rule is the important one — it eliminates layout
+ * wrappers like `<div class="top">` whose only child is a `<span>` with the
+ * actual text. We tag the `<span>`, not the wrapper.
  */
 function isTextLeaf(el: Element): boolean {
   if (SKIP_TAGS.has(el.tagName.toLowerCase())) return false;
-  let ownText = "";
-  let hasChildEl = false;
+  let ownTextLen = 0;
+  let hasBlockChild = false;
   for (let i = 0; i < el.childNodes.length; i++) {
     const n = el.childNodes[i];
     if (n.nodeType === 3) {
-      ownText += n.nodeValue || "";
+      const t = (n.nodeValue || "").replace(/\s+/g, "");
+      ownTextLen += t.length;
     } else if (n.nodeType === 1) {
-      hasChildEl = true;
+      const tag = (n as Element).tagName.toLowerCase();
+      if (!INLINE_TEXT_TAGS.has(tag)) {
+        hasBlockChild = true;
+        break;
+      }
     }
   }
-  if (hasChildEl) return false;
-  return ownText.replace(/\s+/g, "").length > 0;
+  if (hasBlockChild) return false;
+  // Must directly contain at least one non-whitespace text node. This
+  // disqualifies pure layout wrappers (`<div class="top">` containing only a
+  // `<span>` child) — the span itself will be picked up on the next walk
+  // step, with a tight Range-measured bounding box.
+  return ownTextLen > 0;
 }
 
 interface Rect {
@@ -120,41 +161,194 @@ interface LayerEntry {
   kind: LayerKind;
   /** True if user has activated inline edit mode (contenteditable). */
   editing?: boolean;
+  /**
+   * True once the runtime has actually committed a positional override
+   * (position:absolute + left/top/etc) to this element. Until then,
+   * `applyTransform` calls that match the cached rect within ~1px are
+   * treated as no-ops so authored flex/grid layouts and CSS animations
+   * survive.
+   */
+  absolutized?: boolean;
+  /**
+   * True when this entry's `el` is a server-emitted replica (its
+   * `data-oc-layer-kind` attribute was already set by `applyOverrides`,
+   * not by the runtime). Replicas are positioned via inline style by
+   * `addLayer`/`applyTransform` and require no flex/grid preservation.
+   */
+  isReplica?: boolean;
 }
 
 const layerById = new Map<string, LayerEntry>();
 let layerOrder: string[] = [];
 
+/**
+ * Measure an element's TIGHT visual bounds — the union of every text Range
+ * inside it. For headings with negative line-height or extra padding this is
+ * dramatically tighter than `getBoundingClientRect()` of the layout box, and
+ * matches what the user actually sees on screen.
+ *
+ * Falls back to `getBoundingClientRect()` if Range measurement fails.
+ */
+function measureTextRect(el: HTMLElement): Rect {
+  try {
+    let minLeft = Infinity;
+    let minTop = Infinity;
+    let maxRight = -Infinity;
+    let maxBottom = -Infinity;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let node: Node | null = walker.nextNode();
+    let any = false;
+    while (node) {
+      const txt = (node.nodeValue || "").trim();
+      if (txt.length > 0) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const rects = range.getClientRects();
+        for (let i = 0; i < rects.length; i++) {
+          const r = rects[i];
+          if (r.width === 0 && r.height === 0) continue;
+          any = true;
+          if (r.left < minLeft) minLeft = r.left;
+          if (r.top < minTop) minTop = r.top;
+          if (r.right > maxRight) maxRight = r.right;
+          if (r.bottom > maxBottom) maxBottom = r.bottom;
+        }
+      }
+      node = walker.nextNode();
+    }
+    if (any) {
+      return {
+        x: minLeft,
+        y: minTop,
+        w: maxRight - minLeft,
+        h: maxBottom - minTop,
+      };
+    }
+  } catch {
+    // Range API hiccup — fall through to layout box.
+  }
+  const r = el.getBoundingClientRect();
+  return { x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
 function tagAndMeasureLayers(): void {
   layerById.clear();
   layerOrder = [];
+
+  // PASS 1 — server-emitted replicas (BUG-004).
+  //
+  // `applyOverrides` (in canvas-overrides.ts) appends replica <div>s to the
+  // body, each carrying BOTH `data-oc-layer-id="X"` AND
+  // `data-oc-layer-kind="existing|new"`. These are the live, editable copies.
+  // We must:
+  //   - register them with their pre-set id (DON'T re-hash),
+  //   - mark them as the canonical entry for that id (so the original is
+  //     skipped in pass 2 to avoid the BUG-004 id collision),
+  //   - force visibility:visible inline (beats the visibility:hidden
+  //     stylesheet rule that applyOverrides emits to hide the original;
+  //     until that selector is tightened to :not([data-oc-layer-kind]),
+  //     the replica would otherwise inherit the same hide rule).
+  const replicas = document.body.querySelectorAll<HTMLElement>("[data-oc-layer-kind][data-oc-layer-id]");
+  for (let i = 0; i < replicas.length; i++) {
+    const el = replicas[i];
+    const id = el.getAttribute("data-oc-layer-id") || "";
+    const kindAttr = el.getAttribute("data-oc-layer-kind");
+    if (!id) continue;
+    if (layerById.has(id)) continue;
+    // Beat the [data-oc-layer-id="X"]{visibility:hidden} stylesheet rule.
+    el.style.setProperty("visibility", "visible", "important");
+    const rect = measureTextRect(el);
+    layerById.set(id, {
+      id,
+      el,
+      rect,
+      kind: kindAttr === "new" ? "new" : "existing",
+      isReplica: true,
+      // Replicas are already positioned by applyOverrides' inline style;
+      // treat them as already-absolutized so subsequent applyTransform
+      // calls re-apply faithfully.
+      absolutized: true,
+    });
+    layerOrder.push(id);
+  }
+
+  // PASS 2 — Claude-authored elements.
   const all = document.body.querySelectorAll("*");
+  // Track elements that are descendants of an already-tagged leaf so we
+  // don't tag inline children twice (e.g. tagging <h1> AND its <span>).
+  const taggedAncestors: Element[] = [];
   for (let i = 0; i < all.length; i++) {
     const el = all[i] as HTMLElement;
+    // Skip server-emitted replicas — they were handled in pass 1, and we
+    // must NEVER re-hash an id that matches a replica or the parent's
+    // overrides will key against an orphaned entry (BUG-004).
+    if (el.hasAttribute("data-oc-layer-kind")) continue;
     if (!isTextLeaf(el)) continue;
+    let inside = false;
+    for (let j = 0; j < taggedAncestors.length; j++) {
+      if (taggedAncestors[j].contains(el) && taggedAncestors[j] !== el) {
+        inside = true;
+        break;
+      }
+    }
+    if (inside) continue;
     const tag = el.tagName.toLowerCase();
     const path = cssPathOf(el);
     const text = el.textContent || "";
     const id = hashLayerId(tag, path, text);
-    if (layerById.has(id)) continue; // collision: keep first
+    // BUG-004: if a replica already owns this id, skip. The replica is the
+    // live element; the original stays exactly as Claude authored it
+    // (and remains hidden by applyOverrides' stylesheet rule, which is
+    // correct because the rule selector matches data-oc-layer-id only —
+    // the original keeps its id attribute, the replica's inline
+    // visibility:visible override keeps the replica visible).
+    if (layerById.has(id)) {
+      // Surface a debug breadcrumb so a regression in cssPath uniqueness
+      // isn't silently swallowed (S-1 / BUG-019 hygiene).
+      try {
+        // eslint-disable-next-line no-console
+        console.debug("[oc-runtime] layer id collision; keeping first", id, tag, path);
+      } catch {
+        // ignore
+      }
+      continue;
+    }
     el.setAttribute("data-oc-layer-id", id);
-    const r = el.getBoundingClientRect();
+    taggedAncestors.push(el);
+    const rect = measureTextRect(el);
+    // Skip degenerate / off-screen elements (zero-area, negative coords) —
+    // they create huge phantom selection boxes when picked up by hit-test.
+    if (rect.w <= 0 || rect.h <= 0) {
+      el.removeAttribute("data-oc-layer-id");
+      taggedAncestors.pop();
+      continue;
+    }
     layerById.set(id, {
       id,
       el,
-      rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+      rect,
       kind: "existing",
+      absolutized: false,
     });
     layerOrder.push(id);
+  }
+
+  // Tag the document so DevTools can verify the right runtime is loaded.
+  try {
+    document.documentElement.setAttribute("data-oc-runtime-version", RUNTIME_VERSION);
+  } catch {
+    // ignore
   }
 }
 
 function remeasureAll(): void {
+  // Use the same Range-based glyph measurement as `measureTextRect()` so
+  // re-measuring after a transform produces a tight rect for text leaves
+  // whose layout box differs from glyph bounds (BUG-003 hygiene).
   layerOrder.forEach((id) => {
     const entry = layerById.get(id);
     if (!entry) return;
-    const r = entry.el.getBoundingClientRect();
-    entry.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    entry.rect = measureTextRect(entry.el);
   });
 }
 
@@ -199,13 +393,14 @@ const SELECTED_CLASS = "oc-editor-selected";
 let currentSelection: string[] = [];
 
 function injectSelectionStyles(): void {
+  // The parent's SelectionOverlay (SVG drawn over the iframe) is the
+  // single source of truth for visual selection. We used to also draw a
+  // blue outline inside the iframe via the .oc-editor-selected class,
+  // but it duplicated and clashed with the parent's brand-colored handles.
+  // Keep ONLY the cursor hint here.
   const style = document.createElement("style");
   style.setAttribute("data-oc-editor-style", "1");
-  style.textContent =
-    "[data-oc-layer-id]." +
-    SELECTED_CLASS +
-    "{outline:2px solid #2563eb!important;outline-offset:2px!important;}" +
-    "[data-oc-layer-id]{cursor:default;}";
+  style.textContent = "[data-oc-layer-id]{cursor:default;}";
   document.head.appendChild(style);
 }
 
@@ -232,22 +427,106 @@ interface AppliedTransform {
   z?: number;
 }
 
+/**
+ * BUG-003 fix: applyTransform is now idempotent and non-destructive.
+ *
+ * The OLD implementation unconditionally set `position:absolute`,
+ * `visibility:visible`, and `transform: rotate(0deg)` on every call. That
+ * blew authored flex/grid children out of layout (because their cached
+ * rect was viewport-coords but `left/top` is interpreted relative to the
+ * nearest positioned ancestor) AND clobbered authored CSS animations on
+ * `transform`.
+ *
+ * New behaviour:
+ *   - If the layer has NEVER been absolutized AND the requested
+ *     (x, y, w, h) match the element's current rendered rect within ~1px,
+ *     this call is a no-op. The seeded "snapshot" replay on iframe boot
+ *     therefore leaves the element in pristine flex/grid flow.
+ *   - Once `entry.absolutized` flips true (because the user actually
+ *     dragged/resized to coords that DIFFER from the cached rect), all
+ *     subsequent applyTransform calls re-apply faithfully.
+ *   - `el.style.transform` is only touched when `t.rotation` is a non-zero,
+ *     non-null number. A null/undefined/0 rotation leaves any authored
+ *     `transform: translate(...)` or `animation: name (transform...)`
+ *     untouched. This is imperfect (a deliberate user-set rotation of 0
+ *     won't strip an inherited rotate), but is SAFE for the common case.
+ *   - `visibility:visible` is only set when the element actually appears
+ *     to be hidden — never as a default.
+ *   - `z-index` is only set when `t.z != null`. Callers passing `null`/
+ *     `undefined` won't drop the layer into a sibling's stacking order.
+ */
 function applyTransform(id: string, t: AppliedTransform): void {
   const entry = layerById.get(id);
   if (!entry) return;
   const el = entry.el;
-  el.style.position = "absolute";
-  // Reset visibility in case the original-layout style had hidden it.
-  el.style.visibility = "visible";
-  if (t.x != null) el.style.left = t.x + "px";
-  if (t.y != null) el.style.top = t.y + "px";
-  if (t.w != null) el.style.width = t.w + "px";
-  if (t.h != null) el.style.height = t.h + "px";
-  if (t.rotation != null) el.style.transform = "rotate(" + t.rotation + "deg)";
+
+  // No-op detection: if the override carries no positional fields at all,
+  // skip the positional block entirely. (Style-only overrides still want
+  // z-index updates handled below.)
+  const hasPositional =
+    t.x != null || t.y != null || t.w != null || t.h != null;
+
+  if (hasPositional) {
+    // Idempotent skip: if the element has never been absolutized AND every
+    // supplied positional field already matches the cached rect within 1px,
+    // do nothing. This is the seeded-snapshot replay path that used to
+    // corrupt flex/grid children.
+    if (!entry.absolutized) {
+      const cur = entry.rect;
+      const close = (a: number | null | undefined, b: number): boolean => {
+        if (a == null) return true;
+        return Math.abs(a - b) <= 1;
+      };
+      const matchesRect =
+        close(t.x, cur.x) &&
+        close(t.y, cur.y) &&
+        close(t.w, cur.w) &&
+        close(t.h, cur.h);
+      if (matchesRect) {
+        // Pure no-op for positional fields. Still apply z-index and
+        // rotation below if the caller meant to nudge those.
+      } else {
+        // The user has actually moved/resized. Commit to canvas-positioning.
+        el.style.position = "absolute";
+        if (t.x != null) el.style.left = t.x + "px";
+        if (t.y != null) el.style.top = t.y + "px";
+        if (t.w != null) el.style.width = t.w + "px";
+        if (t.h != null) el.style.height = t.h + "px";
+        entry.absolutized = true;
+      }
+    } else {
+      // Already absolutized — re-apply faithfully.
+      el.style.position = "absolute";
+      if (t.x != null) el.style.left = t.x + "px";
+      if (t.y != null) el.style.top = t.y + "px";
+      if (t.w != null) el.style.width = t.w + "px";
+      if (t.h != null) el.style.height = t.h + "px";
+    }
+  }
+
+  // Rotation: only touch `el.style.transform` when a meaningful rotation
+  // was supplied. Skipping the 0/undefined case preserves authored
+  // `transform: translate(...)` (centering tricks) and CSS animations
+  // (e.g. `.swipe .ar { animation: nudge ...; }`).
+  if (t.rotation != null && t.rotation !== 0) {
+    el.style.transform = "rotate(" + t.rotation + "deg)";
+  }
+
+  // z-index: only when the caller actually set it. Don't default to 0.
   if (t.z != null) el.style.zIndex = String(t.z);
+
+  // Visibility: only re-show if currently hidden. Never set unconditionally.
+  // (Replicas already had visibility:visible !important pinned in
+  // tagAndMeasureLayers; this branch covers a future case where another
+  // override toggled it.)
+  if (el.style.visibility === "hidden") {
+    el.style.visibility = "visible";
+  }
+
   // Refresh cached rect so subsequent hit-tests see the new position.
-  const r = el.getBoundingClientRect();
-  entry.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+  // Use the Range-based measurement to match `tagAndMeasureLayers`'s
+  // tight-glyph bounds (BUG-012 / BUG-003 hygiene).
+  entry.rect = measureTextRect(el);
 }
 
 interface AppliedStyle {
@@ -313,6 +592,10 @@ function addLayer(layer: NewLayerInput): void {
     el: div,
     rect: { x: r.left, y: r.top, w: r.width, h: r.height },
     kind: (layer.kind || "new"),
+    // Runtime-created divs are absolute from birth; the next applyTransform
+    // call should commit positioning faithfully (no idempotent-skip).
+    absolutized: true,
+    isReplica: true,
   });
   layerOrder.push(layer.id);
   applyTransform(layer.id, layer.transform);
@@ -385,7 +668,28 @@ function exitInlineEdit(entry: LayerEntry): void {
   entry.editing = false;
   entry.el.removeAttribute("contenteditable");
   const text = entry.el.textContent || "";
-  postToParent("oc:editor:text-edit", { id: entry.id, text: text });
+  // Snapshot the original element's computed style so the parent can seed
+  // the override's `style` field. Without this, the replica <div> that
+  // applyOverrides emits inherits browser defaults (16px Times Roman black)
+  // and the edited text looks nothing like the original.
+  const cs = window.getComputedStyle(entry.el);
+  const computed = {
+    fontFamily: cs.fontFamily || undefined,
+    fontSize: cs.fontSize ? parseFloat(cs.fontSize) : undefined,
+    fontWeight: cs.fontWeight ? parseInt(cs.fontWeight, 10) || undefined : undefined,
+    fontStyle: cs.fontStyle === "italic" ? "italic" : "normal",
+    color: cs.color || undefined,
+    textAlign: cs.textAlign || undefined,
+    lineHeight:
+      cs.lineHeight && cs.lineHeight !== "normal"
+        ? parseFloat(cs.lineHeight) / (parseFloat(cs.fontSize) || 16)
+        : undefined,
+    letterSpacing:
+      cs.letterSpacing && cs.letterSpacing !== "normal"
+        ? parseFloat(cs.letterSpacing)
+        : undefined,
+  };
+  postToParent("oc:editor:text-edit", { id: entry.id, text: text, computed: computed });
 }
 
 function onBlurCapture(ev: FocusEvent): void {

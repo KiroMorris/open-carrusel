@@ -84,6 +84,11 @@ export async function exportSlide(
     inlineFontCss: inlinedFontCss,
     overrides: slide.canvasOverrides ?? null,
     editorRuntime: false,
+    // BUG-021: Puppeteer doesn't run the editor runtime. Without "export"
+    // mode, transform-only / style-only edits to existing layers are silently
+    // dropped from the rendered PNG. Export mode forces every overridden
+    // existing layer to be emitted as a replica.
+    mode: "export",
   });
 
   const br = await getBrowser();

@@ -88,20 +88,38 @@ export function CanvasIframe({
   const outerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
+  const [isReady, setIsReady] = useState(false);
   const { width: slideW, height: slideH } = DIMENSIONS[aspectRatio];
 
-  // Re-render the iframe content when html / ratio / overrides change.
-  // Note: changing srcDoc tears down the runtime and reinstalls it on the
-  // next ready handshake — that's correct for Phase 2; Phase 3 may want a
-  // patch-only path to preserve selection across overrides updates.
+  // BUG-002 fix: treat `overrides` as a side-channel.
+  //
+  // Putting `overrides` in `srcDoc`'s memo deps caused the iframe to be
+  // assigned a fresh `srcDoc` on every drag tick / Inspector tweak, which
+  // made the browser tear down and reboot the iframe — wiping caret state,
+  // selection, in-flight pointer drags, and the runtime's layout cache.
+  //
+  // We now bake `overrides` into the FIRST srcDoc only (so initial paint
+  // is consistent), then push subsequent changes through postMessage so
+  // the live runtime can mutate the DOM in place without a reboot.
+  const initialOverridesRef = useRef<CanvasOverrides | null>(overrides ?? null);
   const srcDoc = useMemo(
     () =>
       wrapSlideHtml(html, aspectRatio, {
-        overrides: overrides ?? null,
+        overrides: initialOverridesRef.current,
         editorRuntime: true,
       }),
-    [html, aspectRatio, overrides]
+    // `overrides` intentionally omitted — see comment above.
+    [html, aspectRatio]
   );
+
+  // When the slide swaps (new html / aspectRatio), reset the baseline so
+  // the next srcDoc bakes in the current overrides for first paint.
+  useEffect(() => {
+    initialOverridesRef.current = overrides ?? null;
+    // We deliberately omit `overrides` from deps: this only runs on slide
+    // swap, not when overrides mutate during editing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [html, aspectRatio]);
 
   // Stable sender function.
   const send = useCanvasSender(iframeRef);
@@ -114,6 +132,71 @@ export function CanvasIframe({
       if (sendRef) sendRef.current = null;
     };
   }, [send, sendRef]);
+
+  // Track the last overrides snapshot we synced into the iframe so we can
+  // diff and only ship changed/added/removed layers on each render.
+  const lastSentRef = useRef<CanvasOverrides | null>(initialOverridesRef.current);
+
+  // When the slide HTML/ratio changes, the new srcDoc has already been
+  // re-baked with the current `initialOverridesRef.current`, so the runtime
+  // boots with that as its baseline. Resync `lastSentRef` to that baseline
+  // so the diffing effect doesn't immediately try to re-send everything (or
+  // worse, "delete" layers from the previous slide).
+  useEffect(() => {
+    lastSentRef.current = initialOverridesRef.current;
+    setIsReady(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [html, aspectRatio]);
+
+  // Live overrides → postMessage diff sync. Only runs once the runtime has
+  // signaled `oc:editor:ready`.
+  useEffect(() => {
+    if (!isReady) return;
+    const next = overrides ?? null;
+    const prev = lastSentRef.current;
+
+    // Sync added / changed layers.
+    if (next) {
+      for (const id of next.order) {
+        const layer = next.layers[id];
+        if (!layer) continue;
+        const prevLayer = prev?.layers[id];
+        const changed =
+          !prevLayer ||
+          JSON.stringify(prevLayer.transform) !== JSON.stringify(layer.transform) ||
+          JSON.stringify(prevLayer.style) !== JSON.stringify(layer.style);
+
+        if (!prevLayer && layer.kind === "new") {
+          // Brand new layer that didn't exist in the previous snapshot or
+          // in the baked srcDoc — ask the runtime to create it.
+          send({ type: "oc:editor:add-layer", payload: { layer } });
+        } else if (changed) {
+          send({
+            type: "oc:editor:apply-transform",
+            payload: { id, transform: layer.transform },
+          });
+          send({
+            type: "oc:editor:apply-style",
+            payload: { id, style: layer.style },
+          });
+        }
+        if (layer.text != null && layer.text !== prevLayer?.text) {
+          send({ type: "oc:editor:apply-text", payload: { id, text: layer.text } });
+        }
+      }
+    }
+
+    // Sync deletions: anything in prev that's gone in next.
+    if (prev) {
+      for (const id of prev.order) {
+        if (!next?.layers[id]) {
+          send({ type: "oc:editor:delete-layer", payload: { id } });
+        }
+      }
+    }
+
+    lastSentRef.current = next;
+  }, [overrides, isReady, send]);
 
   // Measure outer container for scale-to-fit.
   const measure = useCallback(() => {
@@ -142,7 +225,12 @@ export function CanvasIframe({
     const iframe = iframeRef.current;
     if (!iframe) return;
     const teardown = installCanvasListener(iframe, {
-      onReady,
+      onReady: (payload) => {
+        // Flip the local readiness flag so the overrides-diff effect can
+        // start streaming live updates via postMessage.
+        setIsReady(true);
+        onReady?.(payload);
+      },
       onLayout,
       onPointerDown,
       onPointerMove,

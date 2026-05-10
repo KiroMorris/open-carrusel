@@ -79,6 +79,49 @@ function defaultStyle(): LayerStyle {
   return {};
 }
 
+// BUG-005 — drag must move at least this many pixels (Manhattan distance)
+// before we treat the gesture as a real drag and start writing overrides.
+const DRAG_THRESHOLD_PX = 3;
+
+// BUG-001 — no-op guard for `mutateLayer({commit:false})`. If the mutator
+// produced a layer that's identical to the previous one in every field we
+// care about, skip the React state write entirely so the iframe doesn't
+// reboot for nothing.
+function shallowLayerEqual(a: CanvasLayer, b: CanvasLayer): boolean {
+  if (a === b) return true;
+  if (a.text !== b.text) return false;
+  if (a.kind !== b.kind) return false;
+  const at = a.transform;
+  const bt = b.transform;
+  if (
+    at.x !== bt.x ||
+    at.y !== bt.y ||
+    at.w !== bt.w ||
+    at.h !== bt.h ||
+    at.rotation !== bt.rotation ||
+    at.z !== bt.z
+  ) {
+    return false;
+  }
+  const as = a.style ?? {};
+  const bs = b.style ?? {};
+  const styleKeys: (keyof LayerStyle)[] = [
+    "fontFamily",
+    "fontSize",
+    "fontWeight",
+    "fontStyle",
+    "color",
+    "textAlign",
+    "lineHeight",
+    "letterSpacing",
+    "textTransform",
+  ];
+  for (const k of styleKeys) {
+    if (as[k] !== bs[k]) return false;
+  }
+  return true;
+}
+
 export function CanvasEditor({
   carouselId,
   slideId,
@@ -248,6 +291,15 @@ export function CanvasEditor({
         transform: { ...seedLayer.transform },
         style: { ...seedLayer.style },
       });
+      // BUG-001 — if there's an existing override for this layer and the
+      // mutator produced an identical layer, skip both the React state
+      // write and the save. Without this guard the iframe (whose `srcDoc`
+      // depends on `overrides`) reboots mid-pointer-event for no reason.
+      const prevLayer = prev?.layers[id];
+      if (prevLayer && shallowLayerEqual(prevLayer, nextLayer)) {
+        // Keep overridesRef in sync — but no React state churn.
+        return;
+      }
       base.layers[id] = nextLayer;
       if (!base.order.includes(id)) base.order.push(id);
       setOverrides(base);
@@ -429,6 +481,18 @@ export function CanvasEditor({
 
       if (drag.kind !== "body") return;
 
+      // BUG-005 — require >3px Manhattan movement before treating this
+      // gesture as a drag. Sub-pixel jitter on a click should NOT flip
+      // dragModifiedRef → which would otherwise cascade into a phantom
+      // setOverrides + iframe reboot (BUG-001/BUG-002).
+      if (!dragModifiedRef.current) {
+        const totalDx = p.clientX - drag.startPointer.x;
+        const totalDy = p.clientY - drag.startPointer.y;
+        if (Math.abs(totalDx) + Math.abs(totalDy) <= DRAG_THRESHOLD_PX) {
+          return;
+        }
+      }
+
       // Phase 4 — snap math against all sibling boxes.
       const otherBoxes = layout
         .filter((l) => !selectedIds.includes(l.id))
@@ -535,6 +599,14 @@ export function CanvasEditor({
       const slideY = (ev.clientY - rect.top) / scale;
       const dx = slideX - drag.info.pointerSlideX;
       const dy = slideY - drag.info.pointerSlideY;
+      // BUG-005 — handle drags (resize + rotate) need the same threshold,
+      // expressed in slide coords. Skip both the throttled send AND the
+      // mutate until the user has actually moved past the dead zone.
+      if (!dragModifiedRef.current) {
+        if (Math.abs(dx) + Math.abs(dy) <= DRAG_THRESHOLD_PX) {
+          return;
+        }
+      }
       const start = drag.info.startTransform;
       const shift = ev.shiftKey;
       const alt = ev.altKey;
@@ -622,9 +694,24 @@ export function CanvasEditor({
   }, [selectedIds, selectedId]);
 
   // --- Phase 4: inline-text edit (commit on blur from runtime) -----------
+  // The runtime sends the original element's computed style alongside the new
+  // text so the merged HTML's replica <div> doesn't fall back to browser
+  // defaults (16px Times Roman black). We only seed style fields the layer
+  // doesn't already override — the user's explicit Inspector edits win.
   const onTextEdit = useCallback(
-    (p: { id: string; text: string }) => {
-      mutateLayer(p.id, (l) => ({ ...l, text: p.text }), { commit: true });
+    (p: {
+      id: string;
+      text: string;
+      computed?: Partial<LayerStyle>;
+    }) => {
+      mutateLayer(
+        p.id,
+        (l) => {
+          const seededStyle: LayerStyle = { ...(p.computed || {}), ...l.style };
+          return { ...l, text: p.text, style: seededStyle };
+        },
+        { commit: true }
+      );
     },
     [mutateLayer]
   );
@@ -1038,6 +1125,15 @@ export function CanvasEditor({
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
             onTextEdit={onTextEdit}
+            onDoubleClickText={({ id }) => {
+              // Double-click on an existing text layer activates inline edit.
+              setSelectedId(id);
+              setSelectedIds([id]);
+              sendRef.current?.({
+                type: "oc:editor:enter-inline-edit",
+                payload: { id },
+              });
+            }}
             sendRef={sendRef}
           />
           {scale > 0 && (
@@ -1066,6 +1162,26 @@ export function CanvasEditor({
         onSelectLayer={onSelectFromPanel}
         onDeleteLayer={deleteLayer}
         onZOrderLayer={setLayerZ}
+        hasOverrides={
+          !!overrides && Object.keys(overrides.layers).length > 0
+        }
+        onResetSlide={() => {
+          // Cancel any pending debounced save, then immediately PUT null.
+          if (saveTimerRef.current) {
+            clearTimeout(saveTimerRef.current);
+            saveTimerRef.current = null;
+          }
+          setOverrides(null);
+          setSelectedId(null);
+          setSelectedIds([]);
+          flushSave(null);
+          onOverridesChange?.(null);
+          // Force a fresh iframe boot so it re-walks Claude's HTML cleanly.
+          // The simplest way: bump a key that React passes to CanvasIframe.
+          // We don't have that wired yet — easiest fallback is a hard reload
+          // of the page so the user sees the original immediately.
+          window.location.reload();
+        }}
       />
       <KeyboardHelpOverlay />
     </div>

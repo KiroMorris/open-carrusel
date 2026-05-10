@@ -36,7 +36,7 @@ test("applyOverrides: empty layers map returns html unchanged", () => {
   assert.equal(applyOverrides(html, overrides), html);
 });
 
-test("applyOverrides: existing-layer override emits data-oc-layer-id and inline transform", () => {
+test("applyOverrides: existing-layer override emits data-oc-layer-id and inline transform (when text overridden)", () => {
   const html = `<div class="slide"><h1>Hello</h1></div>`;
   const id = hashLayerId("h1", "div>h1", "Hello");
   const overrides: CanvasOverrides = {
@@ -48,6 +48,12 @@ test("applyOverrides: existing-layer override emits data-oc-layer-id and inline 
         kind: "existing",
         transform: { x: 100, y: 200, w: 400, h: 80, rotation: 0, z: 0 },
         style: { fontSize: 48, color: "#ff0000" },
+        // Text override is required to make us emit a replica for an
+        // existing layer. Without it, the original element stays in place
+        // and the runtime applies transform/style to it directly — that
+        // way single-click selection in refine mode doesn't visually wipe
+        // the slide by turning every layer into an empty replica.
+        text: "Hello",
       },
     },
   };
@@ -162,14 +168,18 @@ test("hashLayerId: text normalization (whitespace + case) collapses to same id",
   assert.equal(a, b);
 });
 
-test("hashLayerId: different inputs → different ids", () => {
+test("hashLayerId: different (tag, cssPath) → different ids", () => {
   const a = hashLayerId("h1", "body>h1", "Hello");
   const b = hashLayerId("h2", "body>h1", "Hello");
   const c = hashLayerId("h1", "body>h2", "Hello");
-  const d = hashLayerId("h1", "body>h1", "Goodbye");
   assert.notEqual(a, b);
   assert.notEqual(a, c);
-  assert.notEqual(a, d);
+});
+
+test("hashLayerId: text changes do NOT change the id (otherwise inline edits would orphan overrides)", () => {
+  const a = hashLayerId("h1", "body>h1", "Hello");
+  const b = hashLayerId("h1", "body>h1", "Goodbye");
+  assert.equal(a, b);
 });
 
 test("hashLayerId: id is non-empty and prefixed with oc-", () => {
@@ -309,4 +319,257 @@ test("wrapSlideHtml: animation @keyframes survives override application", () => 
   const out = wrapSlideHtml(html, "4:5", { overrides });
   assert.ok(/@keyframes\s+swipe/.test(out), "keyframes survived");
   assert.ok(/animation:swipe/.test(out), "animation property survived");
+});
+
+// ---------------------------------------------------------------------------
+// BUG-021 — applyOverrides({ mode })
+// ---------------------------------------------------------------------------
+
+// Helper: derive the same layer id the runtime would produce for the first
+// `<h1>` direct child of `<body>`.
+function existingLayerId(): string {
+  // matches editor-runtime.ts cssPathOf: tag:nth-of-type(n) starting from
+  // the element below body.
+  return hashLayerId("h1", "h1:nth-of-type(1)");
+}
+
+test("applyOverrides: default mode is 'preview' (no replica for existing transform-only)", () => {
+  const html = `<h1>Original Title</h1>`;
+  const id = existingLayerId();
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 100, y: 0, w: 400, h: 80, rotation: 0, z: 0 },
+        style: {},
+        // no text override
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides);
+  // No replica emitted (preview mode).
+  assert.ok(!result.includes(`data-oc-layer-id="${id}"`), "no replica in preview");
+  // Original html still inside the wrapper.
+  assert.ok(result.includes(html));
+});
+
+test("applyOverrides: mode:'preview' explicit matches default", () => {
+  const html = `<h1>Original Title</h1>`;
+  const id = existingLayerId();
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 100, y: 0, w: 400, h: 80, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const a = applyOverrides(html, overrides);
+  const b = applyOverrides(html, overrides, { mode: "preview" });
+  assert.equal(a, b);
+});
+
+test("applyOverrides: mode:'export' emits replica for existing transform-only override (BUG-021)", () => {
+  const html = `<h1>Original Title</h1>`;
+  const id = existingLayerId();
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 100, y: 200, w: 400, h: 80, rotation: 0, z: 0 },
+        style: { fontSize: 48 },
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  // Replica emitted with merged transform.
+  assert.ok(
+    result.includes(`data-oc-layer-id="${id}"`),
+    "expected replica with layer id"
+  );
+  assert.ok(result.includes("left:100px"), "x override present");
+  assert.ok(result.includes("top:200px"), "y override present");
+  assert.ok(result.includes("font-size:48px"), "style override present");
+  // Recovered original text appears in replica.
+  assert.ok(result.includes("Original Title"), "recovered original text in replica");
+  // Hide-original CSS rule is emitted so the original doesn't bleed through.
+  assert.ok(
+    /\[data-oc-layer-id="[^"]+"\][^}]*visibility:hidden/.test(result),
+    "expected hide-originals CSS rule"
+  );
+  // The matched original tag has been server-side tagged with the layer id
+  // so the visibility:hidden rule actually targets it.
+  assert.ok(
+    new RegExp(`<h1[^>]*data-oc-layer-id="${id}"`).test(result),
+    "original <h1> got the layer-id attribute injected"
+  );
+});
+
+test("applyOverrides: mode:'export' emits replica for existing layer with text override too", () => {
+  const html = `<h1>Original Title</h1>`;
+  const id = existingLayerId();
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 0, y: 0, w: 100, h: 50, rotation: 0, z: 0 },
+        style: {},
+        text: "Edited Title",
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  assert.ok(result.includes(`data-oc-layer-id="${id}"`));
+  assert.ok(result.includes("Edited Title"), "text override wins over scanned text");
+  assert.ok(!result.match(/Edited Title.*Edited Title/s), "no duplicate replica");
+});
+
+test("applyOverrides: mode:'export' new layer behavior is unchanged", () => {
+  const html = `<div>x</div>`;
+  const newId = "oc-new-export-1";
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [newId],
+    layers: {
+      [newId]: {
+        id: newId, kind: "new", text: "fresh",
+        transform: { x: 5, y: 6, w: 50, h: 20, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  assert.ok(result.includes(`data-oc-layer-id="${newId}"`));
+  assert.ok(result.includes("fresh"));
+  // No hide-original block for purely-new layers.
+  assert.ok(!result.includes("visibility:hidden"));
+});
+
+test("applyOverrides: mode:'export' preserves @keyframes / animation declarations", () => {
+  const html = `<style>@keyframes glow{0%{opacity:.5}100%{opacity:1}}</style><h1 style="animation:glow 1s infinite">Title</h1>`;
+  const id = hashLayerId("h1", "h1:nth-of-type(1)");
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 50, y: 60, w: 200, h: 40, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  assert.ok(/@keyframes\s+glow/.test(result), "keyframes survived");
+  assert.ok(/animation:glow/.test(result), "animation property survived");
+});
+
+test("applyOverrides: mode:'export' tagging the original handles deletion + replica replacement", () => {
+  // Same setup as the transform-only test, but verify the original element's
+  // visibility is hidden (so only the replica is visible in the PNG).
+  const html = `<h1>Hello</h1>`;
+  const id = existingLayerId();
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 999, y: 999, w: 100, h: 100, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  // The injected attribute on the original makes the visibility:hidden CSS
+  // selector target the original, hiding it. The replica at (999,999)
+  // remains visible.
+  const originalIdx = result.indexOf(`<h1 data-oc-layer-id="${id}">`);
+  assert.ok(originalIdx > -1, "original tagged with id");
+  assert.ok(result.indexOf("visibility:hidden") < originalIdx, "hide rule before original");
+});
+
+test("applyOverrides: mode:'export' falls back to empty replica when scanner can't find element", () => {
+  // Override targets a layer id that doesn't match anything in the slide html.
+  const html = `<h1>Hello</h1>`;
+  const ghostId = "oc-ghost-id-not-in-html";
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [ghostId],
+    layers: {
+      [ghostId]: {
+        id: ghostId, kind: "existing",
+        transform: { x: 10, y: 20, w: 30, h: 40, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  // Replica is still emitted (positioned correctly) — better than silent loss.
+  assert.ok(result.includes(`data-oc-layer-id="${ghostId}"`));
+  assert.ok(result.includes("left:10px"));
+  // Original h1 untouched.
+  assert.ok(result.includes("<h1>Hello</h1>"));
+});
+
+test("applyOverrides: mode:'export' nested element css-path scanner produces matching id", () => {
+  // Mimics a typical Claude slide: <div class="slide"><div class="top"><h1>...</h1></div></div>
+  const html = `<div class="slide"><div class="top"><h1>Nested Title</h1></div></div>`;
+  const cssPath = "div:nth-of-type(1)>div:nth-of-type(1)>h1:nth-of-type(1)";
+  const id = hashLayerId("h1", cssPath);
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 333, y: 444, w: 200, h: 80, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  assert.ok(
+    result.includes(`data-oc-layer-id="${id}"`),
+    "replica for nested element"
+  );
+  assert.ok(result.includes("left:333px"));
+  assert.ok(result.includes("Nested Title"), "recovered nested text");
+});
+
+test("applyOverrides: mode:'export' nth-of-type counters increment per tag (not per index)", () => {
+  // Two h1 siblings — second one selected.
+  const html = `<h1>First</h1><h1>Second</h1>`;
+  const id = hashLayerId("h1", "h1:nth-of-type(2)");
+  const overrides: CanvasOverrides = {
+    schemaVersion: 1,
+    order: [id],
+    layers: {
+      [id]: {
+        id, kind: "existing",
+        transform: { x: 50, y: 50, w: 100, h: 50, rotation: 0, z: 0 },
+        style: {},
+      },
+    },
+  };
+  const result = applyOverrides(html, overrides, { mode: "export" });
+  assert.ok(result.includes("Second"), "scanned and recovered second h1's text");
+  // But the FIRST h1 must NOT be tagged with this id.
+  assert.ok(
+    !/<h1 data-oc-layer-id="[^"]+">First/.test(result),
+    "first h1 NOT tagged"
+  );
+  assert.ok(
+    new RegExp(`<h1 data-oc-layer-id="${id}">Second`).test(result),
+    "second h1 IS tagged"
+  );
 });

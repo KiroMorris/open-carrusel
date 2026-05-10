@@ -109,9 +109,26 @@ export interface DoubleClickTextMessage {
   payload: { id: string };
 }
 // Phase 4 — emitted on contenteditable blur after inline-edit.
+// `computed` carries the original element's resolved style snapshot so the
+// parent can seed the override's style fields. Without it, the replica <div>
+// applyOverrides emits inherits browser defaults instead of looking like the
+// original glyphs.
 export interface TextEditMessage {
   type: "oc:editor:text-edit";
-  payload: { id: string; text: string };
+  payload: {
+    id: string;
+    text: string;
+    computed?: {
+      fontFamily?: string;
+      fontSize?: number;
+      fontWeight?: number;
+      fontStyle?: "normal" | "italic";
+      color?: string;
+      textAlign?: string;
+      lineHeight?: number;
+      letterSpacing?: number;
+    };
+  };
 }
 
 export type IframeToParentMessage =

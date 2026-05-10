@@ -55,13 +55,20 @@ export function wrapSlideHtml(
     inlineFontCss?: string;
     overrides?: CanvasOverrides | null;
     editorRuntime?: boolean;
+    /**
+     * Pass-through to `applyOverrides`. Default is `"preview"` (current
+     * behavior). Export call sites (`export-slides.ts`, `export-video.ts`)
+     * MUST pass `"export"` so existing-layer transform/style edits survive
+     * the runtime-less Puppeteer render. See BUG-021.
+     */
+    mode?: "preview" | "export";
   }
 ): string {
   const { width, height } = DIMENSIONS[aspectRatio];
   // Apply overrides BEFORE we extract fonts so any new layer's font-family
   // is picked up in the Google Fonts <link>.
   const mergedHtml = options?.overrides
-    ? applyOverrides(slideHtml, options.overrides)
+    ? applyOverrides(slideHtml, options.overrides, { mode: options?.mode })
     : slideHtml;
   const fontFamilies = extractFontFamilies(mergedHtml);
 

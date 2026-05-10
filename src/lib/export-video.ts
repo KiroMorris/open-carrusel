@@ -83,6 +83,9 @@ export async function exportSlideVideo(
     inlineFontCss: inlinedFontCss,
     overrides: slide.canvasOverrides ?? null,
     editorRuntime: false,
+    // BUG-021: same as `exportSlide` — without "export" mode, transform-only
+    // edits on existing layers vanish from the recorded MP4.
+    mode: "export",
   });
 
   const browser = await getBrowser();
