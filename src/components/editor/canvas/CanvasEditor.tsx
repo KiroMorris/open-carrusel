@@ -33,29 +33,43 @@ import {
   type CSSProperties,
 } from "react";
 import { CanvasIframe } from "./CanvasIframe";
-import { Inspector, type AlignKind } from "./Inspector";
+import {
+  Inspector,
+  type AlignKind,
+  type InspectorSelectedItem,
+} from "./Inspector";
 import { KeyboardHelpOverlay } from "./KeyboardHelpOverlay";
 import {
   SelectionOverlay,
   type HandleId,
   type MarqueeRect,
   type OverlayDragStart,
+  type SelectionKind,
 } from "./SelectionOverlay";
 import { useCanvasUndo } from "./useCanvasUndo";
 import { rafThrottle } from "@/lib/throttle";
 import { computeSnap, type SnapGuide } from "./useSnap";
-import type { ZDirection } from "./LayersPanel";
+import {
+  textLayerToEntry,
+  type LayerListEntry,
+  type ZDirection,
+} from "./LayersPanel";
 import type {
   CanvasLayer,
   CanvasOverrides,
+  FrameTransform,
+  ImageOverride,
   LayerStyle,
   LayerTransform,
+  ShapeOverride,
 } from "@/types/carousel";
 import { DIMENSIONS } from "@/types/carousel";
 import type {
+  ImageFrameInitMessage,
   MeasuredLayer,
   Modifiers,
   ParentToIframeMessage,
+  ShapeInitMessage,
 } from "@/types/canvas";
 import { generateId } from "@/lib/utils";
 
@@ -87,6 +101,50 @@ const DRAG_THRESHOLD_PX = 3;
 // produced a layer that's identical to the previous one in every field we
 // care about, skip the React state write entirely so the iframe doesn't
 // reboot for nothing.
+// Phase 3 (canvas-image-frames). Lazy-seeded image-frame and shape entries
+// don't enter `overrides.images` / `overrides.shapes` until the user FIRST
+// edits them. Until then, the runtime has emitted an init payload that we
+// stash in these accumulator maps.
+type ImageInitPayload = ImageFrameInitMessage["payload"];
+type ShapeInitPayload = ShapeInitMessage["payload"];
+
+function shallowImageEqual(a: ImageOverride, b: ImageOverride): boolean {
+  if (a === b) return true;
+  if (a.id !== b.id || a.kind !== b.kind || a.source !== b.source) return false;
+  const af = a.frame;
+  const bf = b.frame;
+  if (
+    af.x !== bf.x ||
+    af.y !== bf.y ||
+    af.w !== bf.w ||
+    af.h !== bf.h ||
+    af.rotation !== bf.rotation ||
+    af.z !== bf.z
+  )
+    return false;
+  const ai = a.image;
+  const bi = b.image;
+  if (ai.scale !== bi.scale || ai.tx !== bi.tx || ai.ty !== bi.ty) return false;
+  return true;
+}
+
+function shallowShapeEqual(a: ShapeOverride, b: ShapeOverride): boolean {
+  if (a === b) return true;
+  if (a.id !== b.id || a.kind !== b.kind || a.source !== b.source) return false;
+  const af = a.frame;
+  const bf = b.frame;
+  if (
+    af.x !== bf.x ||
+    af.y !== bf.y ||
+    af.w !== bf.w ||
+    af.h !== bf.h ||
+    af.rotation !== bf.rotation ||
+    af.z !== bf.z
+  )
+    return false;
+  return true;
+}
+
 function shallowLayerEqual(a: CanvasLayer, b: CanvasLayer): boolean {
   if (a === b) return true;
   if (a.text !== b.text) return false;
@@ -136,11 +194,37 @@ export function CanvasEditor({
   const [overrides, setOverrides] = useState<CanvasOverrides | null>(
     initialOverrides
   );
+  // Phase 3 (canvas-image-frames). Init payloads accumulated from the runtime
+  // — never cleared during a session. `getOrSeedImage` / `getOrSeedShape` use
+  // these to materialize an `ImageOverride` / `ShapeOverride` on first edit.
+  const [imageInits, setImageInits] = useState<Map<string, ImageInitPayload>>(
+    () => new Map()
+  );
+  const [shapeInits, setShapeInits] = useState<Map<string, ShapeInitPayload>>(
+    () => new Map()
+  );
+  // Map id → original `<img>` src URL, captured from runtime hints (Phase 3
+  // shows it as a thumbnail in the inspector). We extract from the iframe's
+  // active document; until that's available we just don't show a thumbnail.
+  const [imageSrcById, setImageSrcById] = useState<Map<string, string>>(
+    () => new Map()
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // Phase 4: multi-select. `selectedId` (Phase 3) is kept as the PRIMARY
   // selection (the layer that owns the resize/rotate handles); `selectedIds`
   // is the full set including primary.
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Phase 4 (canvas-image-frames). Inside-frame mode state. `currentMode`
+  // mirrors the runtime's mode for the CURRENTLY active image frame; null
+  // means no special mode (text/shape selection or empty selection).
+  // `activeFrameId` is the id of the image frame whose interior is being
+  // panned/zoomed. While in inside-frame mode the SelectionOverlay draws
+  // a solid blue outline (no handles), the runtime intercepts pointer +
+  // wheel events on that frame, and Esc / outside-click exits.
+  const [currentMode, setCurrentMode] = useState<"frame" | "inside-frame" | null>(
+    null
+  );
+  const [activeFrameId, setActiveFrameId] = useState<string | null>(null);
   const [layout, setLayout] = useState<MeasuredLayer[]>([]);
   // Phase 4 — snap guides drawn during a drag.
   const [guides, setGuides] = useState<SnapGuide[]>([]);
@@ -238,6 +322,28 @@ export function CanvasEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slideId]);
 
+  // Phase 3 (canvas-image-frames). Refine-mode exit cleanup. The runtime
+  // exposes `__ocRuntimeRestore()` on its `window` to unwrap synthesized
+  // image-frame wrappers + restore stashed parent styles. Call it when this
+  // editor unmounts (refine → preview, or slide swap), so the iframe DOM
+  // is byte-restored to Claude's original layout if the user hasn't saved
+  // any persisted overrides for those frames.
+  useEffect(() => {
+    return () => {
+      const iframe = containerRef.current?.querySelector(
+        "iframe"
+      ) as HTMLIFrameElement | null;
+      const win = iframe?.contentWindow as
+        | (Window & { __ocRuntimeRestore?: () => void })
+        | null;
+      try {
+        win?.__ocRuntimeRestore?.();
+      } catch {
+        // The iframe may already be torn down; nothing to do.
+      }
+    };
+  }, []);
+
   // --- Layer access helpers -----------------------------------------------
   const layoutById = useMemo(() => {
     const m = new Map<string, MeasuredLayer>();
@@ -272,6 +378,123 @@ export function CanvasEditor({
     if (!selectedId) return null;
     return getOrSeedLayer(selectedId);
   }, [selectedId, getOrSeedLayer]);
+
+  // --- Phase 3 (canvas-image-frames): image / shape seeders + kind ------
+
+  const getOrSeedImage = useCallback(
+    (id: string): ImageOverride | null => {
+      const existing = overrides?.images?.[id];
+      if (existing) return existing;
+      const init = imageInits.get(id);
+      if (!init) return null;
+      return {
+        id,
+        kind: "image-frame",
+        frame: { ...init.frame },
+        image: { ...init.image },
+        natural: { ...init.natural },
+        naturalFrameRect: { ...init.naturalFrameRect },
+        source: init.source,
+      };
+    },
+    [overrides, imageInits]
+  );
+
+  const getOrSeedShape = useCallback(
+    (id: string): ShapeOverride | null => {
+      const existing = overrides?.shapes?.[id];
+      if (existing) return existing;
+      const init = shapeInits.get(id);
+      if (!init) return null;
+      return {
+        id,
+        kind: "shape",
+        frame: { ...init.frame },
+        naturalRect: { ...init.naturalRect },
+        // Phase 1 ShapeOverride.source: "wrapped" | "parent". Default to
+        // "wrapped" — the runtime currently only emits shape-init for entries
+        // it has set up via the wrap path.
+        source: "wrapped",
+      };
+    },
+    [overrides, shapeInits]
+  );
+
+  /**
+   * Lookup order (Phase 3 invariant — landmine #4): images → shapes → layers
+   * → init maps → null. Each layer id lives in exactly one map.
+   */
+  type LayerKind = "text" | "image-frame" | "shape";
+  const getLayerKind = useCallback(
+    (id: string): LayerKind | null => {
+      if (overrides?.images?.[id]) return "image-frame";
+      if (overrides?.shapes?.[id]) return "shape";
+      if (overrides?.layers?.[id]) return "text";
+      if (imageInits.has(id)) return "image-frame";
+      if (shapeInits.has(id)) return "shape";
+      // Fall back to layout (text leaves the runtime detected at boot).
+      const measured = layoutById.get(id);
+      if (measured) return "text";
+      return null;
+    },
+    [overrides, imageInits, shapeInits, layoutById]
+  );
+
+  // Discriminated selection — drives Inspector + SelectionOverlay routing.
+  const selectedItem: InspectorSelectedItem = useMemo(() => {
+    if (!selectedId) return null;
+    const k = getLayerKind(selectedId);
+    if (k === "image-frame") {
+      const image = getOrSeedImage(selectedId);
+      if (!image) return null;
+      return {
+        kind: "image-frame",
+        image,
+        sourceSrc: imageSrcById.get(selectedId) ?? null,
+      };
+    }
+    if (k === "shape") {
+      const shape = getOrSeedShape(selectedId);
+      if (!shape) return null;
+      return { kind: "shape", shape };
+    }
+    if (k === "text") {
+      const layer = getOrSeedLayer(selectedId);
+      if (!layer) return null;
+      return { kind: "text", layer };
+    }
+    return null;
+  }, [
+    selectedId,
+    getLayerKind,
+    getOrSeedImage,
+    getOrSeedShape,
+    getOrSeedLayer,
+    imageSrcById,
+  ]);
+
+  // The SelectionOverlay's `transform` prop accepts any LayerTransform-shaped
+  // object. For image/shape entries we feed the FrameTransform directly — it
+  // structurally matches.
+  const selectedKind: SelectionKind =
+    selectedItem?.kind === "image-frame"
+      ? "image-frame"
+      : selectedItem?.kind === "shape"
+        ? "shape"
+        : "text";
+
+  const selectedFrameTransform: LayerTransform | null = useMemo(() => {
+    if (!selectedItem) return selectedLayer?.transform ?? null;
+    if (selectedItem.kind === "image-frame") {
+      const f = selectedItem.image.frame;
+      return { x: f.x, y: f.y, w: f.w, h: f.h, rotation: f.rotation, z: f.z };
+    }
+    if (selectedItem.kind === "shape") {
+      const f = selectedItem.shape.frame;
+      return { x: f.x, y: f.y, w: f.w, h: f.h, rotation: f.rotation, z: f.z };
+    }
+    return selectedItem.layer.transform;
+  }, [selectedItem, selectedLayer]);
 
   // --- Mutate helpers -----------------------------------------------------
   const mutateLayer = useCallback(
@@ -310,9 +533,316 @@ export function CanvasEditor({
     [getOrSeedLayer, scheduleSave]
   );
 
+  // Phase 3 (canvas-image-frames). Image-frame mutator. Mirrors `mutateLayer`
+  // but writes into `overrides.images`.
+  const mutateImage = useCallback(
+    (
+      id: string,
+      framePartial?: Partial<FrameTransform>,
+      imagePartial?: Partial<ImageOverride["image"]>,
+      options?: { commit?: boolean }
+    ) => {
+      const prev = overridesRef.current;
+      const base: CanvasOverrides = prev
+        ? {
+            ...prev,
+            images: { ...(prev.images ?? {}) },
+            order: prev.order.slice(),
+            schemaVersion: 2,
+          }
+        : { layers: {}, images: {}, shapes: {}, order: [], schemaVersion: 2 };
+      const seed = base.images?.[id] ?? getOrSeedImage(id);
+      if (!seed) return;
+      const next: ImageOverride = {
+        ...seed,
+        frame: { ...seed.frame, ...(framePartial ?? {}) },
+        image: { ...seed.image, ...(imagePartial ?? {}) },
+      };
+      const prevImg = prev?.images?.[id];
+      if (prevImg && shallowImageEqual(prevImg, next)) return;
+      base.images = { ...(base.images ?? {}), [id]: next };
+      if (!base.order.includes(id)) base.order.push(id);
+      setOverrides(base);
+      if (options?.commit !== false) scheduleSave(base, prev);
+    },
+    [getOrSeedImage, scheduleSave]
+  );
+
+  // Phase 3 (canvas-image-frames). Shape mutator — only frame, no image.
+  const mutateShape = useCallback(
+    (
+      id: string,
+      framePartial?: Partial<FrameTransform>,
+      options?: { commit?: boolean }
+    ) => {
+      const prev = overridesRef.current;
+      const base: CanvasOverrides = prev
+        ? {
+            ...prev,
+            shapes: { ...(prev.shapes ?? {}) },
+            order: prev.order.slice(),
+            schemaVersion: 2,
+          }
+        : { layers: {}, images: {}, shapes: {}, order: [], schemaVersion: 2 };
+      const seed = base.shapes?.[id] ?? getOrSeedShape(id);
+      if (!seed) return;
+      const next: ShapeOverride = {
+        ...seed,
+        frame: { ...seed.frame, ...(framePartial ?? {}) },
+      };
+      const prevShape = prev?.shapes?.[id];
+      if (prevShape && shallowShapeEqual(prevShape, next)) return;
+      base.shapes = { ...(base.shapes ?? {}), [id]: next };
+      if (!base.order.includes(id)) base.order.push(id);
+      setOverrides(base);
+      if (options?.commit !== false) scheduleSave(base, prev);
+    },
+    [getOrSeedShape, scheduleSave]
+  );
+
+  // Phase 3 — throttled image/shape transform sends to the runtime.
+  const sendImageTransformThrottled = useMemo(
+    () =>
+      rafThrottle(
+        (
+          id: string,
+          frame?: Partial<FrameTransform>,
+          image?: Partial<ImageOverride["image"]>
+        ) => {
+          sendRef.current?.({
+            type: "oc:editor:apply-image-transform",
+            payload: { id, frame, image },
+          });
+        }
+      ),
+    []
+  );
+  useEffect(
+    () => () => sendImageTransformThrottled.cancel(),
+    [sendImageTransformThrottled]
+  );
+
+  const sendShapeTransformThrottled = useMemo(
+    () =>
+      rafThrottle((id: string, frame?: Partial<FrameTransform>) => {
+        sendRef.current?.({
+          type: "oc:editor:apply-shape-transform",
+          payload: { id, frame },
+        });
+      }),
+    []
+  );
+  useEffect(
+    () => () => sendShapeTransformThrottled.cancel(),
+    [sendShapeTransformThrottled]
+  );
+
+  // --- Phase 4 (canvas-image-frames): inside-frame mode helpers -----------
+
+  /**
+   * Enter inside-frame mode for the named image-frame layer. Selects the
+   * frame, flips local mode state, and asks the runtime to switch its
+   * cursor + start intercepting pointer/wheel events on that frame's body.
+   */
+  const enterInsideFrame = useCallback((id: string) => {
+    setSelectedId(id);
+    setSelectedIds([id]);
+    setActiveFrameId(id);
+    setCurrentMode("inside-frame");
+    sendRef.current?.({
+      type: "oc:editor:set-frame-mode",
+      payload: { id, mode: "inside-frame" },
+    });
+  }, []);
+
+  /**
+   * Exit inside-frame mode (if we're in it). Notifies the runtime to revert
+   * cursor + stop intercepting. Safe to call repeatedly — bails when no
+   * inside-frame is active.
+   */
+  const exitInsideFrame = useCallback(() => {
+    if (currentMode !== "inside-frame" || !activeFrameId) return;
+    const id = activeFrameId;
+    setCurrentMode(null);
+    setActiveFrameId(null);
+    sendRef.current?.({
+      type: "oc:editor:set-frame-mode",
+      payload: { id, mode: "frame" },
+    });
+  }, [currentMode, activeFrameId]);
+
+  // Phase 4: image-frame pan/zoom from runtime. Each event has the FULL
+  // image transform (the runtime did the math). We commit immediately —
+  // the 350ms debounced PUT collapses bursts into one save naturally.
+  const onImagePan = useCallback(
+    (p: { id: string; image: ImageOverride["image"] }) => {
+      mutateImage(p.id, undefined, p.image, { commit: true });
+    },
+    [mutateImage]
+  );
+  const onImageZoom = useCallback(
+    (p: { id: string; image: ImageOverride["image"] }) => {
+      mutateImage(p.id, undefined, p.image, { commit: true });
+    },
+    [mutateImage]
+  );
+
+  // Inspector "Image inside" segment toggle.
+  const onImageFrameModeChange = useCallback(
+    (mode: "frame" | "inside-frame") => {
+      if (!selectedId || getLayerKind(selectedId) !== "image-frame") return;
+      if (mode === "inside-frame") {
+        enterInsideFrame(selectedId);
+      } else {
+        exitInsideFrame();
+      }
+    },
+    [selectedId, getLayerKind, enterInsideFrame, exitInsideFrame]
+  );
+
+  // Inspector scale/tx/ty edits in inside-frame mode.
+  const onInspectorImageChange = useCallback(
+    (image: Partial<ImageOverride["image"]>) => {
+      if (!selectedId || getLayerKind(selectedId) !== "image-frame") return;
+      mutateImage(selectedId, undefined, image, { commit: true });
+      sendRef.current?.({
+        type: "oc:editor:apply-image-transform",
+        payload: { id: selectedId, image },
+      });
+    },
+    [selectedId, getLayerKind, mutateImage]
+  );
+
+  // Inspector "Reset image position" → restore cover-fit calibration.
+  const onResetImagePosition = useCallback(() => {
+    if (!selectedId || getLayerKind(selectedId) !== "image-frame") return;
+    const init = imageInits.get(selectedId);
+    if (!init) return;
+    mutateImage(selectedId, undefined, init.image, { commit: true });
+    sendRef.current?.({
+      type: "oc:editor:apply-image-transform",
+      payload: { id: selectedId, image: init.image },
+    });
+  }, [selectedId, getLayerKind, imageInits, mutateImage]);
+
+  // Reset (delete override) for the currently-selected image/shape.
+  const onResetSelectedFrame = useCallback(() => {
+    if (!selectedId || !selectedItem) return;
+    if (selectedItem.kind !== "image-frame" && selectedItem.kind !== "shape") {
+      return;
+    }
+    const prev = overridesRef.current;
+    if (!prev) return;
+    const base: CanvasOverrides = {
+      ...prev,
+      images: { ...(prev.images ?? {}) },
+      shapes: { ...(prev.shapes ?? {}) },
+      order: prev.order.filter((x) => x !== selectedId),
+      schemaVersion: 2,
+    };
+    if (selectedItem.kind === "image-frame") {
+      delete base.images![selectedId];
+    } else {
+      delete base.shapes![selectedId];
+    }
+    setOverrides(base);
+    scheduleSave(base, prev);
+    // Re-emit cover-fit by sending the natural rect back to the runtime; the
+    // runtime's idempotent guard will restore Claude's original layout.
+    if (selectedItem.kind === "image-frame") {
+      const init = imageInits.get(selectedId);
+      if (init) {
+        sendRef.current?.({
+          type: "oc:editor:apply-image-transform",
+          payload: { id: selectedId, frame: init.frame, image: init.image },
+        });
+      }
+    } else {
+      const init = shapeInits.get(selectedId);
+      if (init) {
+        sendRef.current?.({
+          type: "oc:editor:apply-shape-transform",
+          payload: { id: selectedId, frame: init.frame },
+        });
+      }
+    }
+  }, [selectedId, selectedItem, imageInits, shapeInits, scheduleSave]);
+
+  // Frame change from the inspector (numeric inputs).
+  const onInspectorFrameChange = useCallback(
+    (framePartial: Partial<FrameTransform>) => {
+      if (!selectedId || !selectedItem) return;
+      if (selectedItem.kind === "image-frame") {
+        mutateImage(selectedId, framePartial, undefined, { commit: true });
+        sendImageTransformThrottled(selectedId, framePartial);
+      } else if (selectedItem.kind === "shape") {
+        mutateShape(selectedId, framePartial, { commit: true });
+        sendShapeTransformThrottled(selectedId, framePartial);
+      }
+    },
+    [
+      selectedId,
+      selectedItem,
+      mutateImage,
+      mutateShape,
+      sendImageTransformThrottled,
+      sendShapeTransformThrottled,
+    ]
+  );
+
   // --- Iframe message handlers --------------------------------------------
   const onLayout = useCallback((p: { layers: MeasuredLayer[] }) => {
     setLayout(p.layers);
+  }, []);
+
+  // Phase 3 (canvas-image-frames). Stash init payloads — the seeders consume
+  // these on first edit. Also opportunistically read `<img src>` from the
+  // iframe document to populate the inspector thumbnail.
+  const onImageFrameInit = useCallback(
+    (p: ImageInitPayload) => {
+      setImageInits((prev) => {
+        if (prev.has(p.id)) return prev;
+        const next = new Map(prev);
+        next.set(p.id, p);
+        return next;
+      });
+      // Best-effort: pull the original src from the iframe DOM. The iframe
+      // lives under `containerRef`. Defer to next tick so the runtime has
+      // finished mounting the wrapper element.
+      requestAnimationFrame(() => {
+        const iframe = containerRef.current?.querySelector(
+          "iframe"
+        ) as HTMLIFrameElement | null;
+        const doc = iframe?.contentDocument;
+        if (!doc) return;
+        const wrap = doc.querySelector(
+          `[data-oc-image-frame="${p.id}"], [data-oc-id="${p.id}"]`
+        ) as HTMLElement | null;
+        const img = (wrap?.tagName === "IMG"
+          ? (wrap as HTMLImageElement)
+          : (wrap?.querySelector("img") as HTMLImageElement | null)) as
+          | HTMLImageElement
+          | null;
+        if (img?.src) {
+          setImageSrcById((prev) => {
+            if (prev.get(p.id) === img.src) return prev;
+            const next = new Map(prev);
+            next.set(p.id, img.src);
+            return next;
+          });
+        }
+      });
+    },
+    []
+  );
+
+  const onShapeInit = useCallback((p: ShapeInitPayload) => {
+    setShapeInits((prev) => {
+      if (prev.has(p.id)) return prev;
+      const next = new Map(prev);
+      next.set(p.id, p);
+      return next;
+    });
   }, []);
 
   const onReady = useCallback(
@@ -321,17 +851,38 @@ export function CanvasEditor({
       // fresh refine-mode entry sees the right starting positions.
       const send = sendRef.current;
       if (!send || !overridesRef.current) return;
-      for (const id of overridesRef.current.order) {
-        const layer = overridesRef.current.layers[id];
-        if (!layer) continue;
-        send({
-          type: "oc:editor:apply-transform",
-          payload: { id, transform: layer.transform },
-        });
-        send({
-          type: "oc:editor:apply-style",
-          payload: { id, style: layer.style },
-        });
+      const ovr = overridesRef.current;
+      for (const id of ovr.order) {
+        const layer = ovr.layers[id];
+        if (layer) {
+          send({
+            type: "oc:editor:apply-transform",
+            payload: { id, transform: layer.transform },
+          });
+          send({
+            type: "oc:editor:apply-style",
+            payload: { id, style: layer.style },
+          });
+          continue;
+        }
+        // Phase 4 (canvas-image-frames). Re-apply image-frame and shape
+        // overrides so pan/zoom/frame state survives a slide reload
+        // (guarantee #6).
+        const image = ovr.images?.[id];
+        if (image) {
+          send({
+            type: "oc:editor:apply-image-transform",
+            payload: { id, frame: image.frame, image: image.image },
+          });
+          continue;
+        }
+        const shape = ovr.shapes?.[id];
+        if (shape) {
+          send({
+            type: "oc:editor:apply-shape-transform",
+            payload: { id, frame: shape.frame },
+          });
+        }
       }
     },
     []
@@ -342,9 +893,13 @@ export function CanvasEditor({
     | {
         kind: "body";
         id: string;
+        /** Phase 3 — what kind of layer is being dragged: routes the move
+         *  handler to mutateLayer / mutateImage / mutateShape. */
+        layerKind: "text" | "image-frame" | "shape";
         startTransform: LayerTransform;
         /** Phase 4 — start transforms for every selected layer at drag-start
-         *  so we can apply the same delta in group drag. */
+         *  so we can apply the same delta in group drag. (Group drag for
+         *  Phase 3 only applies to text — image/shape always drag as singletons.) */
         groupStart: Record<string, LayerTransform>;
         /** Initial pointer position in slide coords. */
         startPointer: { x: number; y: number };
@@ -352,6 +907,7 @@ export function CanvasEditor({
     | {
         kind: "handle";
         id: string;
+        layerKind: "text" | "image-frame" | "shape";
         info: OverlayDragStart;
       }
     | {
@@ -372,6 +928,21 @@ export function CanvasEditor({
       clientY: number;
       modifiers: Modifiers;
     }) => {
+      // Phase 4 (canvas-image-frames). If we're in inside-frame mode and the
+      // user clicked OUTSIDE the active frame (different layer or empty
+      // space), exit inside-frame first. The runtime only forwards a
+      // pointer-down for clicks outside the active frame's element (clicks
+      // INSIDE are intercepted as pan), so reaching this handler at all in
+      // inside-frame mode means the user wants out.
+      if (
+        currentMode === "inside-frame" &&
+        activeFrameId &&
+        p.id !== activeFrameId
+      ) {
+        exitInsideFrame();
+        // Don't return — fall through to normal selection logic below.
+      }
+
       // Phase 4 — place-text mode: any click drops a fresh layer.
       if (placeMode) {
         const id = generateId();
@@ -434,26 +1005,84 @@ export function CanvasEditor({
       }
       setSelectedIds(nextSel);
       setSelectedId(p.id);
-      const layer = getOrSeedLayer(p.id);
-      if (!layer) return;
 
-      // Capture start transforms for every layer in the group selection.
+      // Phase 3 (canvas-image-frames). Discriminate the kind to pick the
+      // right start transform + later mutator path.
+      const k = getLayerKind(p.id);
+      let startXf: LayerTransform | null = null;
+      if (k === "image-frame") {
+        const img = getOrSeedImage(p.id);
+        if (img) {
+          const f = img.frame;
+          startXf = { x: f.x, y: f.y, w: f.w, h: f.h, rotation: f.rotation, z: f.z };
+        }
+      } else if (k === "shape") {
+        const shp = getOrSeedShape(p.id);
+        if (shp) {
+          const f = shp.frame;
+          startXf = { x: f.x, y: f.y, w: f.w, h: f.h, rotation: f.rotation, z: f.z };
+        }
+      } else {
+        const layer = getOrSeedLayer(p.id);
+        if (layer) startXf = { ...layer.transform };
+      }
+      if (!startXf) return;
+
+      // Group-start transforms — only meaningful for text-layer multi-drag.
       const groupStart: Record<string, LayerTransform> = {};
       for (const id of nextSel) {
-        const l = getOrSeedLayer(id);
-        if (l) groupStart[id] = { ...l.transform };
+        const ek = getLayerKind(id);
+        if (ek === "text") {
+          const l = getOrSeedLayer(id);
+          if (l) groupStart[id] = { ...l.transform };
+        } else if (ek === "image-frame") {
+          const im = getOrSeedImage(id);
+          if (im) {
+            const f = im.frame;
+            groupStart[id] = {
+              x: f.x,
+              y: f.y,
+              w: f.w,
+              h: f.h,
+              rotation: f.rotation,
+              z: f.z,
+            };
+          }
+        } else if (ek === "shape") {
+          const sh = getOrSeedShape(id);
+          if (sh) {
+            const f = sh.frame;
+            groupStart[id] = {
+              x: f.x,
+              y: f.y,
+              w: f.w,
+              h: f.h,
+              rotation: f.rotation,
+              z: f.z,
+            };
+          }
+        }
       }
       dragRef.current = {
         kind: "body",
         id: p.id,
-        startTransform: { ...layer.transform },
+        layerKind: k ?? "text",
+        startTransform: startXf,
         groupStart,
         startPointer: { x: p.clientX, y: p.clientY },
       };
       dragModifiedRef.current = false;
       lastDragPositionsRef.current = {};
     },
-    [getOrSeedLayer, placeMode, scheduleSave, selectedIds]
+    [
+      getLayerKind,
+      getOrSeedImage,
+      getOrSeedShape,
+      getOrSeedLayer,
+      placeMode,
+      scheduleSave,
+      selectedIds,
+    ]
   );
 
   const onPointerMove = useCallback(
@@ -515,7 +1144,8 @@ export function CanvasEditor({
       const dy = snap.snappedY - drag.startTransform.y;
       dragModifiedRef.current = true;
 
-      // Group drag: apply same delta to every selected layer.
+      // Group drag: apply same delta to every selected layer. Each id
+      // dispatches via the right mutator based on its kind.
       for (const id of selectedIds) {
         const start = drag.groupStart[id];
         if (!start) continue;
@@ -524,12 +1154,33 @@ export function CanvasEditor({
           x: start.x + dx,
           y: start.y + dy,
         };
-        sendTransformThrottled(id, next);
-        mutateLayer(id, (l) => ({ ...l, transform: next }), { commit: false });
+        const ek = getLayerKind(id);
+        if (ek === "image-frame") {
+          sendImageTransformThrottled(id, { x: next.x, y: next.y });
+          mutateImage(id, { x: next.x, y: next.y }, undefined, { commit: false });
+        } else if (ek === "shape") {
+          sendShapeTransformThrottled(id, { x: next.x, y: next.y });
+          mutateShape(id, { x: next.x, y: next.y }, { commit: false });
+        } else {
+          sendTransformThrottled(id, next);
+          mutateLayer(id, (l) => ({ ...l, transform: next }), { commit: false });
+        }
         lastDragPositionsRef.current[id] = { x: next.x, y: next.y };
       }
     },
-    [layout, mutateLayer, selectedIds, sendTransformThrottled, slideW, slideH]
+    [
+      getLayerKind,
+      layout,
+      mutateLayer,
+      mutateImage,
+      mutateShape,
+      selectedIds,
+      sendTransformThrottled,
+      sendImageTransformThrottled,
+      sendShapeTransformThrottled,
+      slideW,
+      slideH,
+    ]
   );
 
   const onPointerUp = useCallback(() => {
@@ -562,30 +1213,74 @@ export function CanvasEditor({
     if (!dragModifiedRef.current) return;
     // Flush any pending throttled transform so the iframe sees the final pos.
     sendTransformThrottled.flush();
+    sendImageTransformThrottled.flush();
+    sendShapeTransformThrottled.flush();
     // Commit: build the final overrides with each layer's final transform and
-    // push as ONE undo+save unit.
+    // push as ONE undo+save unit. Phase 3 splits the per-id commit by kind.
     const prev = overridesRef.current;
     const base: CanvasOverrides = prev
-      ? { ...prev, layers: { ...prev.layers }, order: prev.order.slice() }
-      : { layers: {}, order: [], schemaVersion: 1 };
+      ? {
+          ...prev,
+          layers: { ...prev.layers },
+          images: { ...(prev.images ?? {}) },
+          shapes: { ...(prev.shapes ?? {}) },
+          order: prev.order.slice(),
+          schemaVersion: prev.schemaVersion ?? 2,
+        }
+      : { layers: {}, images: {}, shapes: {}, order: [], schemaVersion: 2 };
     if (drag.kind === "body") {
       for (const id of selectedIds) {
         const finalPos = lastDragPositionsRef.current[id];
         const start = drag.groupStart[id];
         if (!finalPos || !start) continue;
-        const seed = base.layers[id] ?? getOrSeedLayer(id);
-        if (!seed) continue;
-        base.layers[id] = {
-          ...seed,
-          transform: { ...seed.transform, x: finalPos.x, y: finalPos.y },
-        };
+        const ek = getLayerKind(id);
+        if (ek === "image-frame") {
+          const seed = base.images?.[id] ?? getOrSeedImage(id);
+          if (!seed) continue;
+          base.images = {
+            ...(base.images ?? {}),
+            [id]: {
+              ...seed,
+              frame: { ...seed.frame, x: finalPos.x, y: finalPos.y },
+            },
+          };
+        } else if (ek === "shape") {
+          const seed = base.shapes?.[id] ?? getOrSeedShape(id);
+          if (!seed) continue;
+          base.shapes = {
+            ...(base.shapes ?? {}),
+            [id]: {
+              ...seed,
+              frame: { ...seed.frame, x: finalPos.x, y: finalPos.y },
+            },
+          };
+        } else {
+          const seed = base.layers[id] ?? getOrSeedLayer(id);
+          if (!seed) continue;
+          base.layers[id] = {
+            ...seed,
+            transform: { ...seed.transform, x: finalPos.x, y: finalPos.y },
+          };
+        }
         if (!base.order.includes(id)) base.order.push(id);
       }
     }
     setOverrides(base);
     scheduleSave(base, prev);
     sendRef.current?.({ type: "oc:editor:re-measure" });
-  }, [getOrSeedLayer, layout, marquee, scheduleSave, selectedIds, sendTransformThrottled]);
+  }, [
+    getLayerKind,
+    getOrSeedImage,
+    getOrSeedShape,
+    getOrSeedLayer,
+    layout,
+    marquee,
+    scheduleSave,
+    selectedIds,
+    sendTransformThrottled,
+    sendImageTransformThrottled,
+    sendShapeTransformThrottled,
+  ]);
 
   // --- Resize / rotate from SVG overlay -----------------------------------
   useEffect(() => {
@@ -610,6 +1305,23 @@ export function CanvasEditor({
       const start = drag.info.startTransform;
       const shift = ev.shiftKey;
       const alt = ev.altKey;
+
+      // Phase 3 (canvas-image-frames). For image-frame corner-handle resize
+      // with Shift, lock to the IMAGE's natural aspect (per plan §8). Shape:
+      // current frame aspect (existing behavior). Text: current transform aspect.
+      let aspectOverride: number | undefined;
+      const isCorner =
+        drag.info.handle === "nw" ||
+        drag.info.handle === "ne" ||
+        drag.info.handle === "sw" ||
+        drag.info.handle === "se";
+      if (shift && isCorner && drag.layerKind === "image-frame") {
+        const im = getOrSeedImage(drag.id);
+        if (im && im.natural.h > 0) {
+          aspectOverride = im.natural.w / im.natural.h;
+        }
+      }
+
       const next = computeHandleTransform(
         drag.info.handle,
         start,
@@ -618,13 +1330,42 @@ export function CanvasEditor({
         shift,
         alt,
         slideX,
-        slideY
+        slideY,
+        aspectOverride
       );
       dragModifiedRef.current = true;
-      sendTransformThrottled(drag.id, next);
-      mutateLayer(drag.id, (l) => ({ ...l, transform: next }), {
-        commit: false,
-      });
+
+      if (drag.layerKind === "image-frame") {
+        sendImageTransformThrottled(
+          drag.id,
+          { x: next.x, y: next.y, w: next.w, h: next.h, rotation: next.rotation },
+          undefined
+        );
+        mutateImage(
+          drag.id,
+          { x: next.x, y: next.y, w: next.w, h: next.h, rotation: next.rotation },
+          undefined,
+          { commit: false }
+        );
+      } else if (drag.layerKind === "shape") {
+        sendShapeTransformThrottled(drag.id, {
+          x: next.x,
+          y: next.y,
+          w: next.w,
+          h: next.h,
+          rotation: next.rotation,
+        });
+        mutateShape(
+          drag.id,
+          { x: next.x, y: next.y, w: next.w, h: next.h, rotation: next.rotation },
+          { commit: false }
+        );
+      } else {
+        sendTransformThrottled(drag.id, next);
+        mutateLayer(drag.id, (l) => ({ ...l, transform: next }), {
+          commit: false,
+        });
+      }
     };
     const onUp = () => {
       const drag = dragRef.current;
@@ -632,11 +1373,21 @@ export function CanvasEditor({
       dragRef.current = null;
       if (!dragModifiedRef.current) return;
       sendTransformThrottled.flush();
-      const cur = overridesRef.current?.layers[drag.id];
-      if (cur) {
-        mutateLayer(drag.id, (l) => ({ ...l, transform: cur.transform }), {
-          commit: true,
-        });
+      sendImageTransformThrottled.flush();
+      sendShapeTransformThrottled.flush();
+      if (drag.layerKind === "image-frame") {
+        const cur = overridesRef.current?.images?.[drag.id];
+        if (cur) mutateImage(drag.id, cur.frame, cur.image, { commit: true });
+      } else if (drag.layerKind === "shape") {
+        const cur = overridesRef.current?.shapes?.[drag.id];
+        if (cur) mutateShape(drag.id, cur.frame, { commit: true });
+      } else {
+        const cur = overridesRef.current?.layers[drag.id];
+        if (cur) {
+          mutateLayer(drag.id, (l) => ({ ...l, transform: cur.transform }), {
+            commit: true,
+          });
+        }
       }
       sendRef.current?.({ type: "oc:editor:re-measure" });
     };
@@ -648,15 +1399,28 @@ export function CanvasEditor({
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [mutateLayer, scale, sendTransformThrottled]);
+  }, [
+    mutateLayer,
+    mutateImage,
+    mutateShape,
+    scale,
+    sendTransformThrottled,
+    sendImageTransformThrottled,
+    sendShapeTransformThrottled,
+    getOrSeedImage,
+  ]);
 
   const onHandleDown = useCallback(
     (info: OverlayDragStart, _ev: React.PointerEvent) => {
       if (!selectedId) return;
-      dragRef.current = { kind: "handle", id: selectedId, info };
+      // Phase 6 — capture layerKind so the move handler routes the resize
+      // through the correct mutator (text vs image-frame vs shape). Default
+      // to "text" when unknown for back-compat with existing call sites.
+      const layerKind = getLayerKind(selectedId) ?? "text";
+      dragRef.current = { kind: "handle", id: selectedId, layerKind, info };
       dragModifiedRef.current = false;
     },
-    [selectedId]
+    [selectedId, getLayerKind]
   );
 
   // --- Inspector style change --------------------------------------------
@@ -944,12 +1708,68 @@ export function CanvasEditor({
         }
         return;
       }
-      // Esc: clear selection / exit place mode.
+      // Esc: exit inside-frame mode first if active; otherwise clear
+      // selection / exit place mode (existing Phase 4 text behavior).
       if (!meta && e.key === "Escape") {
         e.preventDefault();
+        if (currentMode === "inside-frame") {
+          exitInsideFrame();
+          return;
+        }
         setSelectedIds([]);
         setSelectedId(null);
         setPlaceMode(false);
+        return;
+      }
+      // Phase 4 (canvas-image-frames): "0" key in inside-frame mode resets
+      // image to cover-fit (the only allowed initial state — see plan §9).
+      if (
+        !meta &&
+        e.key === "0" &&
+        currentMode === "inside-frame" &&
+        activeFrameId
+      ) {
+        e.preventDefault();
+        const init = imageInits.get(activeFrameId);
+        if (init) {
+          mutateImage(activeFrameId, undefined, init.image, { commit: true });
+          sendRef.current?.({
+            type: "oc:editor:apply-image-transform",
+            payload: { id: activeFrameId, image: init.image },
+          });
+        }
+        return;
+      }
+      // Phase 4 (canvas-image-frames): arrow keys in inside-frame mode
+      // nudge the IMAGE (tx/ty), not the frame. 1px / 10px with Shift.
+      if (
+        !meta &&
+        currentMode === "inside-frame" &&
+        activeFrameId &&
+        (e.key === "ArrowLeft" ||
+          e.key === "ArrowRight" ||
+          e.key === "ArrowUp" ||
+          e.key === "ArrowDown")
+      ) {
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        const dx =
+          e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+        const dy =
+          e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+        const seed = getOrSeedImage(activeFrameId);
+        if (seed) {
+          const nextImg = {
+            scale: seed.image.scale,
+            tx: seed.image.tx + dx,
+            ty: seed.image.ty + dy,
+          };
+          mutateImage(activeFrameId, undefined, nextImg, { commit: true });
+          sendRef.current?.({
+            type: "oc:editor:apply-image-transform",
+            payload: { id: activeFrameId, image: nextImg },
+          });
+        }
         return;
       }
       // Cmd+]/Cmd+[: bring forward / send back.
@@ -1018,6 +1838,12 @@ export function CanvasEditor({
     duplicateSelection,
     getOrSeedLayer,
     scheduleSave,
+    currentMode,
+    activeFrameId,
+    exitInsideFrame,
+    imageInits,
+    mutateImage,
+    getOrSeedImage,
   ]);
 
   // --- Reset undo stack on slide change ----------------------------------
@@ -1107,6 +1933,48 @@ export function CanvasEditor({
     return out;
   }, [overrides, layout]);
 
+  // Phase 3 (canvas-image-frames). Adapt the text-layer roster to the
+  // discriminated `LayerListEntry` shape the LayersPanel expects, and
+  // splice in image-frame / shape entries from overrides + init payloads.
+  const allLayerEntries: LayerListEntry[] = useMemo(() => {
+    const seen = new Set<string>();
+    const out: LayerListEntry[] = [];
+    const order = overrides?.order ?? [];
+    for (const id of order) {
+      if (overrides?.images?.[id]) {
+        out.push({ id, kind: "image-frame" });
+        seen.add(id);
+      } else if (overrides?.shapes?.[id]) {
+        out.push({ id, kind: "shape" });
+        seen.add(id);
+      } else if (overrides?.layers?.[id]) {
+        out.push(textLayerToEntry(overrides.layers[id]));
+        seen.add(id);
+      }
+    }
+    for (const layer of allLayersInOrder) {
+      if (seen.has(layer.id)) continue;
+      const k = getLayerKind(layer.id);
+      if (k === "image-frame") out.push({ id: layer.id, kind: "image-frame" });
+      else if (k === "shape") out.push({ id: layer.id, kind: "shape" });
+      else out.push(textLayerToEntry(layer));
+      seen.add(layer.id);
+    }
+    // Image-frame / shape ids that exist only as init payloads (never
+    // edited yet) — surface them so the user can select.
+    for (const id of imageInits.keys()) {
+      if (seen.has(id)) continue;
+      out.push({ id, kind: "image-frame" });
+      seen.add(id);
+    }
+    for (const id of shapeInits.keys()) {
+      if (seen.has(id)) continue;
+      out.push({ id, kind: "shape" });
+      seen.add(id);
+    }
+    return out;
+  }, [allLayersInOrder, overrides, imageInits, shapeInits, getLayerKind]);
+
   const selectedLayers: CanvasLayer[] = useMemo(() => {
     return selectedIds
       .map((id) => overrides?.layers[id] ?? getOrSeedLayer(id))
@@ -1160,7 +2028,14 @@ export function CanvasEditor({
             onPointerUp={onPointerUp}
             onTextEdit={onTextEdit}
             onDoubleClickText={({ id }) => {
-              // Double-click on an existing text layer activates inline edit.
+              // Phase 4 (canvas-image-frames): dblclick on an image-frame
+              // → enter inside-frame mode for pan/zoom. dblclick on text
+              // → activate inline edit (existing behavior).
+              const k = getLayerKind(id);
+              if (k === "image-frame") {
+                enterInsideFrame(id);
+                return;
+              }
               setSelectedId(id);
               setSelectedIds([id]);
               sendRef.current?.({
@@ -1168,12 +2043,22 @@ export function CanvasEditor({
                 payload: { id },
               });
             }}
+            onImagePan={onImagePan}
+            onImageZoom={onImageZoom}
+            onImageFrameInit={onImageFrameInit}
+            onShapeInit={onShapeInit}
             sendRef={sendRef}
           />
           {scale > 0 && (
             <div style={overlayWrapperStyle}>
               <SelectionOverlay
-                transform={selectedLayer?.transform ?? null}
+                transform={selectedFrameTransform}
+                kind={
+                  currentMode === "inside-frame" &&
+                  activeFrameId === selectedId
+                    ? "image-frame-inside"
+                    : selectedKind
+                }
                 selectionBoxes={selectedLayers.map((l) => l.transform)}
                 guides={guides}
                 marquee={marquee}
@@ -1189,15 +2074,31 @@ export function CanvasEditor({
       <Inspector
         layer={selectedLayer}
         selectedLayers={selectedLayers}
+        selectedItem={selectedItem}
+        onFrameChange={onInspectorFrameChange}
+        onResetFrame={onResetSelectedFrame}
+        imageFrameMode={
+          selectedItem?.kind === "image-frame" &&
+          activeFrameId === selectedId &&
+          currentMode === "inside-frame"
+            ? "inside-frame"
+            : "frame"
+        }
+        onImageFrameModeChange={onImageFrameModeChange}
+        onImageChange={onInspectorImageChange}
+        onResetImagePosition={onResetImagePosition}
         onStyleChange={onStyleChange}
         onAlign={onAlign}
-        allLayers={allLayersInOrder}
+        allLayers={allLayerEntries}
         selectedIds={selectedIds}
         onSelectLayer={onSelectFromPanel}
         onDeleteLayer={deleteLayer}
         onZOrderLayer={setLayerZ}
         hasOverrides={
-          !!overrides && Object.keys(overrides.layers).length > 0
+          !!overrides &&
+          (Object.keys(overrides.layers).length > 0 ||
+            Object.keys(overrides.images ?? {}).length > 0 ||
+            Object.keys(overrides.shapes ?? {}).length > 0)
         }
         onResetSlide={() => {
           // Cancel any pending debounced save, then immediately PUT null.
@@ -1234,7 +2135,14 @@ function computeHandleTransform(
   shift: boolean,
   alt: boolean,
   pointerSlideX: number,
-  pointerSlideY: number
+  pointerSlideY: number,
+  /**
+   * Phase 3 (canvas-image-frames). When set, Shift-aspect lock uses this
+   * ratio (w/h) instead of the start transform's aspect. Image-frames pass
+   * `natural.w / natural.h` so Shift locks to the source image's aspect
+   * rather than any prior crop.
+   */
+  aspectOverride?: number
 ): LayerTransform {
   if (handle === "rotate") {
     const cx = start.x + start.w / 2;
@@ -1269,10 +2177,14 @@ function computeHandleTransform(
     nh = start.h + dy;
   }
 
-  // Aspect ratio lock — preserve start.w/start.h ratio. Use the larger of the
-  // requested deltas as the driver so the user feels in control.
+  // Aspect ratio lock — preserve start.w/start.h ratio (or aspectOverride
+  // when supplied — Phase 3 image-frame natural-aspect lock). Use the larger
+  // of the requested deltas as the driver so the user feels in control.
   if (shift && start.w > 0 && start.h > 0) {
-    const ratio = start.w / start.h;
+    const ratio =
+      aspectOverride && aspectOverride > 0
+        ? aspectOverride
+        : start.w / start.h;
     if (Math.abs(nw - start.w) > Math.abs(nh - start.h)) {
       const newH = nw / ratio;
       const dh = newH - nh;

@@ -17,7 +17,7 @@
  */
 
 import { useEffect, useMemo, useRef } from "react";
-import type { LayerTransform } from "@/types/carousel";
+import type { FrameTransform, LayerTransform } from "@/types/carousel";
 import type { SnapGuide } from "./useSnap";
 
 export type HandleId =
@@ -31,9 +31,30 @@ export type HandleId =
   | "w"
   | "rotate";
 
+/**
+ * Phase 3 (canvas-image-frames). The active selection kind drives the visual
+ * style + handle behavior:
+ *   - "text" — original text-layer dashed yellow outline + 8 handles + rotate.
+ *   - "image-frame" / "shape" (frame mode) — same dashed yellow outline + 8
+ *     handles + rotate; resize math is identical, kind is forwarded back to
+ *     the parent in `OverlayDragStart` so the parent dispatches to the right
+ *     mutator.
+ *   - "image-frame" (inside-frame mode) — solid blue 4px outline, NO handles.
+ *     Phase 4 wires this; Phase 3 leaves the visual code path implemented but
+ *     "inside-frame" is never set yet.
+ */
+export type SelectionKind =
+  | "text"
+  | "image-frame"
+  | "shape"
+  | "image-frame-inside";
+
 export interface OverlayDragStart {
   kind: "handle";
   handle: HandleId;
+  /** What kind of layer is being resized — drives parent dispatch. */
+  selectionKind: SelectionKind;
+  /** Snapshot of the layer's transform/frame at drag-start. */
   startTransform: LayerTransform;
   pointerSlideX: number;
   pointerSlideY: number;
@@ -50,8 +71,13 @@ export interface MarqueeRect {
 }
 
 interface SelectionOverlayProps {
-  /** PRIMARY selected layer (the one with handles). Null = no selection. */
+  /** PRIMARY selected layer (the one with handles). Null = no selection.
+   *  For text layers this is `layer.transform`; for image-frame / shape
+   *  it is the FrameTransform (same shape, different storage). */
   transform: LayerTransform | null;
+  /** Phase 3 (canvas-image-frames) — what kind of layer is selected.
+   *  Defaults to "text" for backward compat with existing call sites. */
+  kind?: SelectionKind;
   /** Phase 4 — bounding boxes for ALL selected layers. Each gets a dashed
    *  outline. The primary layer gets handles in addition. Slide coords. */
   selectionBoxes?: LayerTransform[];
@@ -68,11 +94,29 @@ interface SelectionOverlayProps {
   onHandleDown: (info: OverlayDragStart, ev: React.PointerEvent) => void;
 }
 
+/**
+ * Convenience: convert a FrameTransform (image-frame/shape) into the
+ * LayerTransform shape expected by SelectionOverlay's `transform` prop. The
+ * two are structurally identical for SVG drawing purposes; this exists so
+ * call sites read clearly.
+ */
+export function frameToOverlayTransform(frame: FrameTransform): LayerTransform {
+  return {
+    x: frame.x,
+    y: frame.y,
+    w: frame.w,
+    h: frame.h,
+    rotation: frame.rotation,
+    z: frame.z,
+  };
+}
+
 const HANDLE_SIZE = 10; // px in PARENT space
 const ROTATE_OFFSET = 30;
 
 export function SelectionOverlay({
   transform,
+  kind = "text",
   selectionBoxes,
   guides,
   marquee,
@@ -109,6 +153,7 @@ export function SelectionOverlay({
       {
         kind: "handle",
         handle,
+        selectionKind: kind,
         startTransform: { ...transform },
         pointerSlideX: slideX,
         pointerSlideY: slideY,
@@ -223,8 +268,40 @@ export function SelectionOverlay({
         />
       )}
 
-      {box && <Selection box={box} onHandleDown={startHandleDrag} />}
+      {box && kind === "image-frame-inside" ? (
+        <InsideFrameSelection box={box} />
+      ) : box ? (
+        <Selection box={box} onHandleDown={startHandleDrag} />
+      ) : null}
     </svg>
+  );
+}
+
+/**
+ * Phase 4 visual: solid blue 4px outline, no handles. Drawn while the user
+ * is panning/zooming inside an image frame. Phase 3 implements the rendering
+ * but never sets `kind: "image-frame-inside"`.
+ */
+function InsideFrameSelection({
+  box,
+}: {
+  box: { x: number; y: number; w: number; h: number; rot: number };
+}) {
+  const cx = box.x + box.w / 2;
+  const cy = box.y + box.h / 2;
+  return (
+    <g transform={box.rot ? `rotate(${box.rot} ${cx} ${cy})` : undefined}>
+      <rect
+        x={box.x}
+        y={box.y}
+        width={box.w}
+        height={box.h}
+        fill="none"
+        stroke="#3B82F6"
+        strokeWidth={4}
+        style={{ pointerEvents: "none" }}
+      />
+    </g>
   );
 }
 

@@ -36,7 +36,7 @@
  *     visible.
  */
 
-const RUNTIME_VERSION = "phase-4-bug-003-004";
+const RUNTIME_VERSION = "phase-4-inside-frame";
 
 // --- Inlined hash (mirror of src/lib/canvas-overrides.ts) -------------------
 
@@ -188,6 +188,305 @@ interface LayerEntry {
 const layerById = new Map<string, LayerEntry>();
 let layerOrder: string[] = [];
 
+// --- Image / shape entries (Phase 2) ----------------------------------------
+//
+// Hash-collision invariant: each detected DOM element MUST land in exactly
+// ONE of `imageById`, `shapeById`, or `layerById`. Detection runs in this
+// order: image-frame → shape → text. A claimed element gets
+// `data-oc-runtime-claimed="image"|"shape"|"text"` and subsequent passes
+// short-circuit on it. If a hash *value* somehow appears in two maps we
+// `console.warn` (defensive against a future cssPath regression).
+
+interface FrameTransformLite {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  z: number;
+}
+
+interface ImageInnerLite {
+  scale: number;
+  tx: number;
+  ty: number;
+}
+
+interface ImageEntry {
+  id: string;
+  /** The wrapping/framing element. Either the synthesized `<div>`, the
+   * reused parent, or the same `<div>` whose background-image is the photo. */
+  frameEl: HTMLElement;
+  /** The `<img>` for "wrapped"/"parent". null for "background". */
+  innerEl: HTMLImageElement | null;
+  source: "wrapped" | "parent" | "background";
+  natural: { w: number; h: number };
+  /** Frame's measured rect at first registration, BEFORE any override
+   * mutates it. Same role as text path's `naturalRect`. */
+  naturalFrameRect: { x: number; y: number; w: number; h: number };
+  /** Currently-applied frame transform (slide-local px). */
+  frame: FrameTransformLite;
+  /** Currently-applied image inner transform. */
+  image: ImageInnerLite;
+  /** Cached visual rect for hit-test. */
+  rect: Rect;
+  /** Has any user-driven transform actually been committed? */
+  applied?: boolean;
+}
+
+interface ShapeEntry {
+  id: string;
+  el: HTMLElement;
+  naturalRect: { x: number; y: number; w: number; h: number };
+  frame: FrameTransformLite;
+  rect: Rect;
+  applied?: boolean;
+}
+
+const imageById = new Map<string, ImageEntry>();
+const shapeById = new Map<string, ShapeEntry>();
+
+/** Background-image natural-dimension cache, keyed by URL. */
+const bgImageNaturalCache = new Map<string, { w: number; h: number } | "pending">();
+
+/**
+ * Per-URL callback queue for in-flight preloads. When a URL is requested
+ * while it is still "pending" (a previous caller fired off `new Image()` but
+ * the load hasn't completed), we push the new caller's `onResolved` here
+ * instead of issuing a duplicate `new Image()`. The `finish()` callback in
+ * `preloadBackground` drains this queue once dims are known. This keeps the
+ * preload to ONE network request per URL even when N elements share it.
+ */
+const pendingBgCallbacks = new Map<string, Array<() => void>>();
+
+/** Mode state — Phase 4 wires this; Phase 2 only mutates it on message. */
+let currentMode: "frame" | "inside-frame" | null = null;
+let activeFrameId: string | null = null;
+
+// --- Phase 4: inside-frame pan state ---------------------------------------
+//
+// When `currentMode === "inside-frame"` AND a pointerdown lands inside the
+// active frame's element, we INTERCEPT the event: don't forward
+// `oc:editor:pointer-down` (which would trigger frame-mode drag), capture
+// the pointer, record the starting image transform + frame-local pointer
+// coords, and on subsequent pointermoves update `entry.image.tx, ty` via
+// `reclampImageToCover`. Emit `oc:editor:image-pan { id, image }` per move.
+let panActive = false;
+let panStartImage: ImageInnerLite | null = null;
+let panStartCursor: { x: number; y: number } | null = null;
+let panFrameRect: { left: number; top: number } | null = null;
+let panPointerId: number | null = null;
+
+// --- Geometry helpers (mirror src/lib/geometryHelpers.ts byte-for-byte) -----
+// Keep these in sync with the helpers exported there. The runtime can't
+// import the module (no bundler in the iframe) so we duplicate. Tests in
+// `geometryHelpers.test.ts` lock down the math; if you change one body
+// without the other, the tests will catch the drift the next time they run.
+
+function coverFitCalibration(
+  natural: { w: number; h: number },
+  frame: { w: number; h: number }
+): ImageInnerLite {
+  if (natural.w <= 0 || natural.h <= 0) {
+    return { scale: 1, tx: 0, ty: 0 };
+  }
+  const scale = Math.max(frame.w / natural.w, frame.h / natural.h);
+  const renderedW = natural.w * scale;
+  const renderedH = natural.h * scale;
+  return {
+    scale: scale,
+    tx: (frame.w - renderedW) / 2,
+    ty: (frame.h - renderedH) / 2,
+  };
+}
+
+function reclampImageToCover(
+  image: ImageInnerLite,
+  frame: { w: number; h: number },
+  natural: { w: number; h: number }
+): ImageInnerLite {
+  if (natural.w <= 0 || natural.h <= 0) return image;
+  const minScale = Math.max(frame.w / natural.w, frame.h / natural.h);
+  let scale = image.scale;
+  if (scale < minScale) scale = minScale;
+  if (scale > 8) scale = 8;
+  const renderedW = natural.w * scale;
+  const renderedH = natural.h * scale;
+  const txMin = frame.w - renderedW;
+  const tyMin = frame.h - renderedH;
+  let tx = image.tx;
+  let ty = image.ty;
+  if (tx > 0) tx = 0;
+  if (tx < txMin) tx = txMin;
+  if (ty > 0) ty = 0;
+  if (ty < tyMin) ty = tyMin;
+  return { scale: scale, tx: tx, ty: ty };
+}
+
+function frameTransformString(
+  frame: { x: number; y: number; rotation: number },
+  naturalRect: { x: number; y: number }
+): string {
+  const dx = frame.x - naturalRect.x;
+  const dy = frame.y - naturalRect.y;
+  const transforms: string[] = [];
+  if (dx !== 0 || dy !== 0) transforms.push("translate(" + dx + "px," + dy + "px)");
+  if (frame.rotation !== 0) transforms.push("rotate(" + frame.rotation + "deg)");
+  return transforms.join(" ");
+}
+
+function innerImageTransformString(image: ImageInnerLite): string {
+  return (
+    "translate(" + image.tx + "px," + image.ty + "px) scale(" + image.scale + ")"
+  );
+}
+
+// --- RAF throttle (Phase 5) -------------------------------------------------
+//
+// Inside-frame pan + wheel zoom can fire `pointermove` / `wheel` at trackpad
+// frequencies (~120fps). The runtime applies the transform per event AND
+// emits an `image-pan` / `image-zoom` postMessage to the parent. Without
+// throttling we burn frames doing the math twice and post unnecessarily. The
+// parent already debounces saves; we coalesce DOM mutation to one call per
+// animation frame here. Uses the same identifier as
+// `src/lib/throttle.ts:rafThrottle` for parity but inlined because the
+// runtime cannot import the external module.
+//
+// Used by: `applyImageFrameTransformThrottled` (the throttled wrapper that
+// the inside-frame pan/zoom handlers call to avoid the 60fps→120fps doubling).
+function rafThrottleRuntime<F extends (...args: never[]) => unknown>(fn: F): F & { flush(): void } {
+  let pendingArgs: unknown[] | null = null;
+  let scheduled = false;
+  const raf =
+    typeof requestAnimationFrame !== "undefined"
+      ? requestAnimationFrame
+      : (cb: FrameRequestCallback) =>
+          setTimeout(() => cb(Date.now()), 16) as unknown as number;
+  function flushFrame() {
+    scheduled = false;
+    if (pendingArgs) {
+      const args = pendingArgs;
+      pendingArgs = null;
+      (fn as unknown as (...a: unknown[]) => void)(...args);
+    }
+  }
+  const wrapped = function (...args: unknown[]) {
+    pendingArgs = args;
+    if (!scheduled) {
+      scheduled = true;
+      raf(flushFrame);
+    }
+  } as unknown as F & { flush(): void };
+  wrapped.flush = () => {
+    scheduled = false;
+    if (pendingArgs) {
+      const args = pendingArgs;
+      pendingArgs = null;
+      (fn as unknown as (...a: unknown[]) => void)(...args);
+    }
+  };
+  return wrapped;
+}
+
+/**
+ * Phase 4 — cursor-anchored zoom. Mirror of `cursorAnchoredZoom` in
+ * src/lib/geometryHelpers.ts; see geometryHelpers.test.ts for the locked
+ * down behavior. Keep the bodies in sync.
+ */
+function cursorAnchoredZoom(
+  prev: ImageInnerLite,
+  cursor: { x: number; y: number },
+  factor: number,
+  natural: { w: number; h: number },
+  frame: { w: number; h: number }
+): ImageInnerLite {
+  if (natural.w <= 0 || natural.h <= 0) return prev;
+  if (prev.scale <= 0) return prev;
+  const minScale = Math.max(frame.w / natural.w, frame.h / natural.h);
+  let newScale = prev.scale * factor;
+  if (newScale < minScale) newScale = minScale;
+  if (newScale > 8) newScale = 8;
+  const cursorImgX = (cursor.x - prev.tx) / prev.scale;
+  const cursorImgY = (cursor.y - prev.ty) / prev.scale;
+  let tx = cursor.x - cursorImgX * newScale;
+  let ty = cursor.y - cursorImgY * newScale;
+  const renderedW = natural.w * newScale;
+  const renderedH = natural.h * newScale;
+  const txMin = frame.w - renderedW;
+  const tyMin = frame.h - renderedH;
+  if (tx > 0) tx = 0;
+  if (tx < txMin) tx = txMin;
+  if (ty > 0) ty = 0;
+  if (ty < tyMin) ty = tyMin;
+  return { scale: newScale, tx: tx, ty: ty };
+}
+
+// --- DOM stash + restore (Phase 2) ------------------------------------------
+//
+// When detection wraps an `<img>` or mutates a parent's overflow, we stash
+// the affected element's pre-mount inline style values as JSON in
+// `data-oc-original-style`. Phase 3 will wire `restoreStashedStyles()` to
+// the refine-mode exit toggle. Phase 2 just guarantees the stash exists.
+
+const STASH_PROPS = [
+  "position", "overflow", "overflowX", "overflowY",
+  "width", "height", "top", "left", "right", "bottom",
+  "margin", "transform", "transformOrigin", "borderRadius",
+  "backgroundSize", "backgroundPosition", "backgroundRepeat",
+  "maxWidth", "maxHeight",
+];
+
+function stashOriginalStyle(el: HTMLElement): void {
+  if (el.hasAttribute("data-oc-original-style")) return; // first wins
+  const snap: Record<string, string> = {};
+  for (let i = 0; i < STASH_PROPS.length; i++) {
+    const p = STASH_PROPS[i] as keyof CSSStyleDeclaration;
+    const v = (el.style as unknown as Record<string, string>)[p as string];
+    if (v != null && v !== "") snap[p as string] = v;
+  }
+  try {
+    el.setAttribute("data-oc-original-style", JSON.stringify(snap));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Restore every element previously stashed by `stashOriginalStyle()`.
+ * NOT wired to anything in Phase 2 — Phase 3 owns the refine-mode exit
+ * toggle that calls this. Exported on `window.__ocRuntimeRestore` for
+ * manual debugging until then.
+ */
+function restoreStashedStyles(): void {
+  const els = document.querySelectorAll<HTMLElement>("[data-oc-original-style]");
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i];
+    let snap: Record<string, string> = {};
+    try {
+      snap = JSON.parse(el.getAttribute("data-oc-original-style") || "{}");
+    } catch {
+      // skip malformed
+      continue;
+    }
+    for (let j = 0; j < STASH_PROPS.length; j++) {
+      const p = STASH_PROPS[j] as string;
+      const styleObj = el.style as unknown as Record<string, string>;
+      styleObj[p] = (snap[p] != null ? snap[p] : "");
+    }
+    el.removeAttribute("data-oc-original-style");
+  }
+  // For `wrapped` source: unwrap any synthesized wrappers, returning the
+  // `<img>` to its original parent.
+  const wrappers = document.querySelectorAll<HTMLElement>("[data-oc-image-wrap]");
+  for (let i = 0; i < wrappers.length; i++) {
+    const wrap = wrappers[i];
+    const parent = wrap.parentElement;
+    if (!parent) continue;
+    while (wrap.firstChild) parent.insertBefore(wrap.firstChild, wrap);
+    parent.removeChild(wrap);
+  }
+}
+
 /**
  * Measure an element's TIGHT visual bounds — the union of every text Range
  * inside it. For headings with negative line-height or extra padding this is
@@ -238,9 +537,434 @@ function measureTextRect(el: HTMLElement): Rect {
   return { x: r.left, y: r.top, w: r.width, h: r.height };
 }
 
+// --- Image-frame detection (Phase 2) ----------------------------------------
+
+interface DetectedImageFrame {
+  source: "wrapped" | "parent";
+  frameEl: HTMLElement;
+  innerEl: HTMLImageElement;
+}
+
+/**
+ * Heuristic: a parent qualifies as an "existing frame" iff it has
+ * `overflow:hidden` (computed) AND every other child is either zero-area
+ * or absolutely-positioned (overlays/badges). The `<img>` is always part
+ * of the qualifying-children set as long as it's the only "visual" child.
+ */
+function isOnlyVisualChild(parent: Element, img: Element): boolean {
+  const kids = parent.children;
+  for (let i = 0; i < kids.length; i++) {
+    const c = kids[i];
+    if (c === img) continue;
+    const r = (c as HTMLElement).getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    const cs = getComputedStyle(c as HTMLElement);
+    if (cs.position === "absolute" || cs.position === "fixed") continue;
+    return false;
+  }
+  return true;
+}
+
+function detectImageFrame(img: HTMLImageElement): DetectedImageFrame {
+  const parent = img.parentElement;
+  if (parent && parent !== document.body) {
+    const cs = getComputedStyle(parent);
+    const overflowHidden =
+      cs.overflow === "hidden" ||
+      cs.overflowX === "hidden" ||
+      cs.overflowY === "hidden";
+    if (overflowHidden && isOnlyVisualChild(parent, img)) {
+      return { source: "parent", frameEl: parent as HTMLElement, innerEl: img };
+    }
+  }
+  // Wrap path. Capture the `<img>`'s pre-mutation visual rect off its
+  // computed style so the wrapper inherits the same in-flow position.
+  const cs = getComputedStyle(img);
+  const wrap = document.createElement("div");
+  wrap.setAttribute("data-oc-image-wrap", "1");
+  wrap.style.position = cs.position === "static" ? "relative" : cs.position;
+  if (cs.top !== "auto") wrap.style.top = cs.top;
+  if (cs.left !== "auto") wrap.style.left = cs.left;
+  if (cs.right !== "auto") wrap.style.right = cs.right;
+  if (cs.bottom !== "auto") wrap.style.bottom = cs.bottom;
+  wrap.style.width = cs.width;
+  wrap.style.height = cs.height;
+  wrap.style.margin = cs.margin;
+  wrap.style.overflow = "hidden";
+  if (cs.borderRadius && cs.borderRadius !== "0px") {
+    wrap.style.borderRadius = cs.borderRadius;
+  }
+  // Stash the `<img>`'s pre-mount inline styles BEFORE we mutate them.
+  stashOriginalStyle(img);
+  const ip = img.parentElement;
+  if (ip) ip.insertBefore(wrap, img);
+  wrap.appendChild(img);
+  // Reset `<img>` to absolute fill.
+  img.style.position = "absolute";
+  img.style.top = "0";
+  img.style.left = "0";
+  img.style.width = "auto";
+  img.style.height = "auto";
+  img.style.maxWidth = "none";
+  img.style.maxHeight = "none";
+  img.style.transformOrigin = "0 0";
+  return { source: "wrapped", frameEl: wrap, innerEl: img };
+}
+
+/**
+ * "Shape-like" element test. Positive list: `svg`, `video`, `iframe`,
+ * `embed` always qualify. A `<div>`/`<span>` qualifies iff it has visual
+ * presence (non-zero size + non-text styling) and contains no significant
+ * own text (otherwise the text-leaf pass should claim it).
+ */
+function isShapeLayer(el: Element): boolean {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "svg" || tag === "video" || tag === "iframe" || tag === "embed") {
+    return true;
+  }
+  if (tag !== "div" && tag !== "span" && tag !== "section" && tag !== "article" && tag !== "aside" && tag !== "header" && tag !== "footer" && tag !== "main" && tag !== "nav") {
+    return false;
+  }
+  // Has its own non-whitespace text? → not a shape.
+  for (let i = 0; i < el.childNodes.length; i++) {
+    const n = el.childNodes[i];
+    if (n.nodeType === 3) {
+      const t = (n.nodeValue || "").replace(/\s+/g, "");
+      if (t.length > 0) return false;
+    }
+  }
+  const r = (el as HTMLElement).getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return false;
+  const cs = getComputedStyle(el as HTMLElement);
+  const hasBg = cs.backgroundImage !== "none" || (cs.backgroundColor !== "rgba(0, 0, 0, 0)" && cs.backgroundColor !== "transparent");
+  const hasBorder = cs.borderStyle !== "none" && parseFloat(cs.borderWidth) > 0;
+  const hasShadow = cs.boxShadow !== "none";
+  const hasClip = cs.clipPath !== "none";
+  return hasBg || hasBorder || hasShadow || hasClip;
+}
+
+/**
+ * Extract a single `url(...)` from a computed background-image. Returns null
+ * for gradient-only, "none", and SVG-data-URI-only backgrounds.
+ *
+ * Tolerates:
+ *   - quoted (`url("…")`, `url('…')`) and unquoted (`url(…)`)
+ *   - sizing/position keywords trailing the url (`url(/x.png) center / cover no-repeat`)
+ *   - multi-layer backgrounds where the first non-SVG `url(...)` wins
+ *     (e.g. `url(/x.png), linear-gradient(...)`)
+ *
+ * Mirrors `extractBgUrl` in `src/lib/geometryHelpers.ts`; tests in
+ * `geometryHelpers.test.ts` lock down the edge cases.
+ */
+function extractBgUrl(bg: string | null | undefined): string | null {
+  if (!bg) return null;
+  const s = String(bg).trim();
+  if (!s || s === "none") return null;
+  const re = /url\(\s*(['"]?)([^'")]*)\1\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const url = m[2].trim();
+    if (!url) continue;
+    if (url.indexOf("data:image/svg") === 0) continue;
+    return url;
+  }
+  return null;
+}
+
+/**
+ * Preload a background-image URL; resolve with `naturalWidth/Height`, cached
+ * by URL across all frames so multiple elements with the same URL share one
+ * preload.
+ *
+ * State per URL in `bgImageNaturalCache`:
+ *   - absent       → not yet requested
+ *   - "pending"    → preload in flight; queue this caller's onResolved onto
+ *                    `pendingBgCallbacks[url]` so it fires once the original
+ *                    `new Image()` finishes
+ *   - { w, h }     → success — cache hit fires `onResolved` synchronously
+ *   - { w:0, h:0 } → failed (404 / CORS) — same synchronous fire; detection
+ *                    callers MUST inspect dims and skip frame registration
+ *                    when zero
+ *
+ * Multiple `<div>`s pointing to the same URL share one in-flight preload.
+ */
+function preloadBackground(url: string, onResolved: () => void): void {
+  const cached = bgImageNaturalCache.get(url);
+  if (cached !== undefined) {
+    if (cached === "pending") {
+      const queue = pendingBgCallbacks.get(url) || [];
+      queue.push(onResolved);
+      pendingBgCallbacks.set(url, queue);
+      return;
+    }
+    onResolved();
+    return;
+  }
+  bgImageNaturalCache.set(url, "pending");
+  pendingBgCallbacks.set(url, [onResolved]);
+  const img = new Image();
+  const finish = (w: number, h: number) => {
+    bgImageNaturalCache.set(url, { w: w, h: h });
+    const queue = pendingBgCallbacks.get(url) || [];
+    pendingBgCallbacks.delete(url);
+    for (let i = 0; i < queue.length; i++) {
+      try { queue[i](); } catch { /* ignore callback failure */ }
+    }
+  };
+  img.onload = () => finish(img.naturalWidth, img.naturalHeight);
+  img.onerror = () => finish(0, 0);
+  img.src = url;
+}
+
+/** Mark an element as claimed by a particular pass. Returns false if it
+ * was already claimed (caller should skip). */
+function tryClaim(el: Element, kind: "image" | "shape" | "text"): boolean {
+  if (el.hasAttribute("data-oc-runtime-claimed")) return false;
+  el.setAttribute("data-oc-runtime-claimed", kind);
+  return true;
+}
+
+/** Register a single image frame after detection. */
+function registerImageFrame(
+  img: HTMLImageElement,
+  detected: DetectedImageFrame
+): { id: string; entry: ImageEntry } | null {
+  // Hash off the original `<img>`'s tag + cssPath (NOT the wrapper's path —
+  // the wrapper is a runtime synthesis and would never match an export-time
+  // splice). Capture the path BEFORE the wrap mutation, but `cssPathOf`
+  // walks the live DOM so we must compute it BEFORE detectImageFrame ran.
+  // Caller is responsible for passing the pre-wrap path; see Pass A.
+  // For wrapped path the parent was mutated, but the `<img>`'s nth-of-type
+  // index inside the new wrapper is 1, which differs from its prior nth-
+  // of-type. We therefore HASH BEFORE detection — see Pass A below.
+  return null; // unused; logic moved inline into Pass A for clarity.
+  void img;
+  void detected;
+}
+void registerImageFrame; // silence "unused" until/if we refactor inline pass into helper
+
+/** Detection passes A/B/C. Runs BEFORE the existing text-leaf pass. */
+function runImageShapeDetection(): void {
+  // -------- Pass A: <img> elements --------
+  const imgs = document.body.querySelectorAll<HTMLImageElement>("img");
+  for (let i = 0; i < imgs.length; i++) {
+    const img = imgs[i];
+    if (img.hasAttribute("data-oc-runtime-claimed")) continue;
+    if (img.hasAttribute("data-oc-no-frame")) continue;
+    if (img.naturalWidth === 0) {
+      // Defer: re-run detection once the image has loaded.
+      const handler = () => {
+        // Re-run the entire tag pass — cheap and avoids partial-state hazards.
+        tagAndMeasureLayers();
+        sendLayout();
+      };
+      img.addEventListener("load", handler, { once: true });
+      img.addEventListener("error", handler, { once: true });
+      continue;
+    }
+    // Capture path BEFORE mutation (wrap moves the img into a new parent).
+    const tag = "img";
+    const path = cssPathOf(img);
+    const id = hashLayerId(tag, path);
+    if (imageById.has(id) || layerById.has(id) || shapeById.has(id)) {
+      // collision — skip
+      continue;
+    }
+    // Special case (landmine #6): `<img>` directly under <body> always uses
+    // wrapped strategy (the parent is body; we'd never want to clip body).
+    const isTopLevelImg = !path.includes(">");
+    let detected: DetectedImageFrame;
+    // Capture the FRAME's natural rect BEFORE any mutation.
+    let preFrameRect: { x: number; y: number; w: number; h: number };
+    if (isTopLevelImg) {
+      // Force wrapped. Pre-rect is the <img>'s own rect.
+      const r = img.getBoundingClientRect();
+      preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+      detected = detectImageFrame(img);
+      // detectImageFrame above wraps unconditionally because parent (body)
+      // doesn't satisfy isOnlyVisualChild + overflow:hidden. Good.
+    } else {
+      // Pre-detection: speculatively decide if we'll reuse parent or wrap.
+      // Either way we want preFrameRect = the FRAME element's pre-mutation
+      // rect, so peek at the heuristic without mutating.
+      const parent = img.parentElement;
+      const parentCs = parent ? getComputedStyle(parent) : null;
+      const parentQualifies =
+        !!parent &&
+        parent !== document.body &&
+        !!parentCs &&
+        (parentCs.overflow === "hidden" ||
+          parentCs.overflowX === "hidden" ||
+          parentCs.overflowY === "hidden") &&
+        isOnlyVisualChild(parent, img);
+      const futureFrameEl = parentQualifies ? (parent as HTMLElement) : img;
+      const r = futureFrameEl.getBoundingClientRect();
+      preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+      detected = detectImageFrame(img);
+    }
+    if (!tryClaim(detected.frameEl, "image")) {
+      // Some other pass beat us — bail (shouldn't happen since image runs first).
+      continue;
+    }
+    // Compute initial cover-fit calibration.
+    const natural = { w: img.naturalWidth, h: img.naturalHeight };
+    const inner = coverFitCalibration(natural, preFrameRect);
+    // Apply initial calibration to the inner image (wrapped path needs it
+    // because we just reset the `<img>` to absolute fill; without the
+    // transform the user would see the natural-size image at top-left).
+    detected.innerEl.style.transform = innerImageTransformString(inner);
+    detected.innerEl.style.transformOrigin = "0 0";
+    const entry: ImageEntry = {
+      id: id,
+      frameEl: detected.frameEl,
+      innerEl: detected.innerEl,
+      source: detected.source,
+      natural: natural,
+      naturalFrameRect: preFrameRect,
+      frame: {
+        x: preFrameRect.x,
+        y: preFrameRect.y,
+        w: preFrameRect.w,
+        h: preFrameRect.h,
+        rotation: 0,
+        z: 10,
+      },
+      image: inner,
+      rect: preFrameRect,
+    };
+    imageById.set(id, entry);
+    layerOrder.push(id);
+    // Emit init message so parent can seed an ImageOverride on first edit.
+    postToParent("oc:editor:image-frame-init", {
+      id: id,
+      natural: natural,
+      source: detected.source,
+      frame: entry.frame,
+      image: entry.image,
+      naturalFrameRect: entry.naturalFrameRect,
+    });
+  }
+
+  // -------- Pass B: background-image elements --------
+  const bgCandidates = document.body.querySelectorAll<HTMLElement>("*");
+  for (let i = 0; i < bgCandidates.length; i++) {
+    const el = bgCandidates[i];
+    if (el.hasAttribute("data-oc-runtime-claimed")) continue;
+    if (el.hasAttribute("data-oc-no-frame")) continue;
+    // Skip if it has any `<img>` child of its own.
+    if (el.querySelector("img")) continue;
+    const cs = getComputedStyle(el);
+    const url = extractBgUrl(cs.backgroundImage);
+    if (!url) continue;
+    const cached = bgImageNaturalCache.get(url);
+    if (cached === "pending") continue;
+    if (!cached) {
+      // Kick off preload; re-run when resolved.
+      preloadBackground(url, () => {
+        tagAndMeasureLayers();
+        sendLayout();
+      });
+      continue;
+    }
+    if (cached.w === 0 || cached.h === 0) continue; // failed
+    const tag = el.tagName.toLowerCase();
+    const path = cssPathOf(el);
+    const id = hashLayerId(tag, path);
+    if (imageById.has(id) || layerById.has(id) || shapeById.has(id)) continue;
+    if (!tryClaim(el, "image")) continue;
+    stashOriginalStyle(el);
+    const r = el.getBoundingClientRect();
+    const preFrameRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    const natural = { w: cached.w, h: cached.h };
+    const inner = coverFitCalibration(natural, preFrameRect);
+    el.style.backgroundSize = natural.w * inner.scale + "px " + natural.h * inner.scale + "px";
+    el.style.backgroundPosition = inner.tx + "px " + inner.ty + "px";
+    el.style.backgroundRepeat = "no-repeat";
+    const entry: ImageEntry = {
+      id: id,
+      frameEl: el,
+      innerEl: null,
+      source: "background",
+      natural: natural,
+      naturalFrameRect: preFrameRect,
+      frame: {
+        x: preFrameRect.x,
+        y: preFrameRect.y,
+        w: preFrameRect.w,
+        h: preFrameRect.h,
+        rotation: 0,
+        z: 10,
+      },
+      image: inner,
+      rect: preFrameRect,
+    };
+    imageById.set(id, entry);
+    layerOrder.push(id);
+    postToParent("oc:editor:image-frame-init", {
+      id: id,
+      natural: natural,
+      source: "background",
+      frame: entry.frame,
+      image: entry.image,
+      naturalFrameRect: entry.naturalFrameRect,
+    });
+  }
+
+  // -------- Pass C: shapes --------
+  const shapeCandidates = document.body.querySelectorAll<HTMLElement>("*");
+  for (let i = 0; i < shapeCandidates.length; i++) {
+    const el = shapeCandidates[i];
+    if (el.hasAttribute("data-oc-runtime-claimed")) continue;
+    if (el.hasAttribute("data-oc-no-frame")) continue;
+    if (el.hasAttribute("data-oc-layer-kind")) continue; // server replica
+    if (!isShapeLayer(el)) continue;
+    const tag = el.tagName.toLowerCase();
+    const path = cssPathOf(el);
+    const id = hashLayerId(tag, path);
+    if (imageById.has(id) || layerById.has(id) || shapeById.has(id)) continue;
+    if (!tryClaim(el, "shape")) continue;
+    const r = el.getBoundingClientRect();
+    const preRect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    const entry: ShapeEntry = {
+      id: id,
+      el: el,
+      naturalRect: preRect,
+      frame: {
+        x: preRect.x,
+        y: preRect.y,
+        w: preRect.w,
+        h: preRect.h,
+        rotation: 0,
+        z: 10,
+      },
+      rect: preRect,
+    };
+    shapeById.set(id, entry);
+    layerOrder.push(id);
+    postToParent("oc:editor:shape-init", {
+      id: id,
+      frame: entry.frame,
+      naturalRect: entry.naturalRect,
+    });
+  }
+}
+
 function tagAndMeasureLayers(): void {
   layerById.clear();
+  imageById.clear();
+  shapeById.clear();
   layerOrder = [];
+  // Clear any prior claim markers so a re-run discovers afresh.
+  const claimed = document.querySelectorAll("[data-oc-runtime-claimed]");
+  for (let i = 0; i < claimed.length; i++) {
+    claimed[i].removeAttribute("data-oc-runtime-claimed");
+  }
+
+  // Phase 2: image-frame + background-image + shape detection BEFORE the
+  // existing text-leaf pass. Each detected element is marked claimed so the
+  // text pass skips it. (Replicas in pass 1 below also predate this set
+  // because they carry data-oc-layer-kind, which the shape pass also skips.)
+  runImageShapeDetection();
 
   // PASS 1 — server-emitted replicas (BUG-004).
   //
@@ -290,6 +1014,9 @@ function tagAndMeasureLayers(): void {
     // must NEVER re-hash an id that matches a replica or the parent's
     // overrides will key against an orphaned entry (BUG-004).
     if (el.hasAttribute("data-oc-layer-kind")) continue;
+    // Phase 2: skip elements claimed by the image/shape passes (BUG-004
+    // analog for the new detection space — never tag an element twice).
+    if (el.hasAttribute("data-oc-runtime-claimed")) continue;
     if (!isTextLeaf(el)) continue;
     let inside = false;
     for (let j = 0; j < taggedAncestors.length; j++) {
@@ -321,6 +1048,7 @@ function tagAndMeasureLayers(): void {
       continue;
     }
     el.setAttribute("data-oc-layer-id", id);
+    el.setAttribute("data-oc-runtime-claimed", "text");
     taggedAncestors.push(el);
     const rect = measureTextRect(el);
     // Skip degenerate / off-screen elements (zero-area, negative coords) —
@@ -352,10 +1080,24 @@ function remeasureAll(): void {
   // Use the same Range-based glyph measurement as `measureTextRect()` so
   // re-measuring after a transform produces a tight rect for text leaves
   // whose layout box differs from glyph bounds (BUG-003 hygiene).
+  // Image frames + shapes use plain bounding-rect (no glyph subtlety).
   layerOrder.forEach((id) => {
-    const entry = layerById.get(id);
-    if (!entry) return;
-    entry.rect = measureTextRect(entry.el);
+    const t = layerById.get(id);
+    if (t) {
+      t.rect = measureTextRect(t.el);
+      return;
+    }
+    const im = imageById.get(id);
+    if (im) {
+      const r = im.frameEl.getBoundingClientRect();
+      im.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+      return;
+    }
+    const sh = shapeById.get(id);
+    if (sh) {
+      const r = sh.el.getBoundingClientRect();
+      sh.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
   });
 }
 
@@ -376,12 +1118,23 @@ function isFromParent(ev: MessageEvent): boolean {
 // --- Hit testing -------------------------------------------------------------
 
 function hitTest(clientX: number, clientY: number): string | null {
-  // Walk in reverse layerOrder so top-most layer wins.
+  // Walk in reverse layerOrder so top-most layer wins. Phase 2: layerOrder
+  // is now a UNION of text + image-frame + shape ids; resolve each by
+  // probing all three maps.
   for (let i = layerOrder.length - 1; i >= 0; i--) {
     const id = layerOrder[i];
-    const entry = layerById.get(id);
-    if (!entry) continue;
-    const r = entry.rect;
+    let r: Rect | null = null;
+    const t = layerById.get(id);
+    if (t) r = t.rect;
+    else {
+      const im = imageById.get(id);
+      if (im) r = im.rect;
+      else {
+        const sh = shapeById.get(id);
+        if (sh) r = sh.rect;
+      }
+    }
+    if (!r) continue;
     if (
       clientX >= r.x &&
       clientX <= r.x + r.w &&
@@ -568,6 +1321,243 @@ interface AppliedStyle {
   textTransform?: string;
 }
 
+// --- Phase 2: image / shape transform application --------------------------
+
+interface FrameTransformPartial {
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  rotation?: number;
+  z?: number;
+}
+
+interface ImageInnerPartial {
+  scale?: number;
+  tx?: number;
+  ty?: number;
+}
+
+/**
+ * Idempotent-guard analog of `applyTransform` for image frames.
+ * - Caches `naturalFrameRect` on first apply (already captured at
+ *   registration; here we only re-confirm `entry.applied` on commit).
+ * - If the frame partial matches `naturalFrameRect` within 1px AND
+ *   rotation is 0 AND no image partial is supplied, skip everything.
+ * - Otherwise mutate `entry.frame` / `entry.image` and apply via
+ *   `transform: translate(...) rotate(...)` (NOT `position:absolute`)
+ *   on the frame element, plus the inner-image transform per source.
+ */
+function applyImageFrameTransform(
+  id: string,
+  framePartial?: FrameTransformPartial,
+  imagePartial?: ImageInnerPartial
+): void {
+  const entry = imageById.get(id);
+  if (!entry) return;
+  const close = (a: number | null | undefined, b: number): boolean => {
+    if (a == null) return true;
+    return Math.abs(a - b) <= 1;
+  };
+  if (framePartial) {
+    if (framePartial.x != null) entry.frame.x = framePartial.x;
+    if (framePartial.y != null) entry.frame.y = framePartial.y;
+    if (framePartial.w != null) entry.frame.w = framePartial.w;
+    if (framePartial.h != null) entry.frame.h = framePartial.h;
+    if (framePartial.rotation != null) entry.frame.rotation = framePartial.rotation;
+    if (framePartial.z != null) entry.frame.z = framePartial.z;
+  }
+  // Idempotent skip: matches natural AND no rotation AND no image partial.
+  const f = entry.frame;
+  const nat = entry.naturalFrameRect;
+  const matchesNatural =
+    close(f.x, nat.x) &&
+    close(f.y, nat.y) &&
+    close(f.w, nat.w) &&
+    close(f.h, nat.h) &&
+    f.rotation === 0;
+  if (!entry.applied && matchesNatural && !imagePartial) {
+    return;
+  }
+  if (framePartial) {
+    const tStr = frameTransformString(f, nat);
+    entry.frameEl.style.transform = tStr;
+    if (Math.abs(f.w - nat.w) > 1) entry.frameEl.style.width = f.w + "px";
+    if (Math.abs(f.h - nat.h) > 1) entry.frameEl.style.height = f.h + "px";
+    if (f.z != null) entry.frameEl.style.zIndex = String(f.z);
+    // For "parent" source, ensure overflow:hidden so the inner img clips.
+    if (entry.source === "parent" && entry.frameEl.style.overflow !== "hidden") {
+      stashOriginalStyle(entry.frameEl);
+      entry.frameEl.style.overflow = "hidden";
+    }
+    entry.applied = true;
+  }
+  // Always re-clamp image to cover invariant whenever frame OR image changed.
+  if (imagePartial) {
+    const merged: ImageInnerLite = {
+      scale: imagePartial.scale != null ? imagePartial.scale : entry.image.scale,
+      tx: imagePartial.tx != null ? imagePartial.tx : entry.image.tx,
+      ty: imagePartial.ty != null ? imagePartial.ty : entry.image.ty,
+    };
+    entry.image = reclampImageToCover(merged, entry.frame, entry.natural);
+    entry.applied = true;
+  } else if (framePartial) {
+    // Frame changed without explicit image partial — re-clamp existing.
+    entry.image = reclampImageToCover(entry.image, entry.frame, entry.natural);
+  }
+  if (entry.source === "background") {
+    const renderedW = entry.natural.w * entry.image.scale;
+    const renderedH = entry.natural.h * entry.image.scale;
+    entry.frameEl.style.backgroundSize = renderedW + "px " + renderedH + "px";
+    entry.frameEl.style.backgroundPosition =
+      entry.image.tx + "px " + entry.image.ty + "px";
+    entry.frameEl.style.backgroundRepeat = "no-repeat";
+  } else if (entry.innerEl) {
+    entry.innerEl.style.transform = innerImageTransformString(entry.image);
+    entry.innerEl.style.transformOrigin = "0 0";
+  }
+  // Refresh cached rect for hit-test.
+  const r = entry.frameEl.getBoundingClientRect();
+  entry.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
+// --- Phase 4: inside-frame mode --------------------------------------------
+
+/**
+ * Switch the named image frame between "frame" and "inside-frame" modes.
+ *
+ * In "inside-frame" mode:
+ *   - The frame's cursor becomes `grab` (and `grabbing` while panning).
+ *   - The runtime intercepts pointerdown/pointermove/wheel events whose
+ *     target lies within the active frame's element (see `onPointerDown`
+ *     and `onWheel` below) instead of forwarding them to the parent. This
+ *     re-routes user gestures to pan/zoom the IMAGE inside the frame
+ *     rather than drag/select the frame itself.
+ *
+ * In "frame" mode (the default):
+ *   - Cursor reverts; events flow through to the parent unchanged. The
+ *     frame can be selected, dragged, resized, rotated like any other
+ *     layer (Phase 3 handles this).
+ *
+ * Calling this with an `id` that doesn't exist in `imageById` is a no-op —
+ * the parent owns mode state and may briefly request a mode change for an
+ * id the runtime hasn't (re)registered after a slide reload.
+ */
+function setFrameMode(id: string, mode: "frame" | "inside-frame"): void {
+  const entry = imageById.get(id);
+  if (!entry) return;
+  if (mode === "inside-frame") {
+    activeFrameId = id;
+    currentMode = "inside-frame";
+    entry.frameEl.style.cursor = "grab";
+  } else {
+    if (activeFrameId === id) activeFrameId = null;
+    currentMode = "frame";
+    entry.frameEl.style.cursor = "";
+  }
+}
+
+/** True iff `target` is the active frame element OR a descendant of it. */
+function isInsideActiveFrame(target: EventTarget | null): boolean {
+  if (!activeFrameId || !target) return false;
+  const entry = imageById.get(activeFrameId);
+  if (!entry) return false;
+  if (!(target instanceof Node)) return false;
+  return entry.frameEl === target || entry.frameEl.contains(target as Node);
+}
+
+/**
+ * Wheel handler — intercepts wheel events while in inside-frame mode AND
+ * the cursor is over the active frame. Computes a per-event factor and
+ * delegates to `cursorAnchoredZoom` (mirror of geometryHelpers.ts) to
+ * keep the pixel under the cursor stationary.
+ */
+function onWheel(ev: WheelEvent): void {
+  if (currentMode !== "inside-frame" || !activeFrameId) return;
+  if (!isInsideActiveFrame(ev.target)) return;
+  const entry = imageById.get(activeFrameId);
+  if (!entry) return;
+  ev.preventDefault();
+  // Factor formula matches plan §9: 1 + deltaY/500, clamped to [0.5, 2].
+  // Negative deltaY (wheel up) → factor > 1 → zoom in.
+  let factor = 1 - ev.deltaY / 500;
+  if (factor < 0.5) factor = 0.5;
+  if (factor > 2) factor = 2;
+  const rect = entry.frameEl.getBoundingClientRect();
+  const cursor = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+  const next = cursorAnchoredZoom(
+    entry.image,
+    cursor,
+    factor,
+    entry.natural,
+    { w: entry.frame.w, h: entry.frame.h }
+  );
+  // Phase 5: coalesce repeated DOM writes during continuous wheel-zoom to
+  // one per animation frame. The math has already run; we just defer the
+  // style mutation to the next paint so 120fps trackpad bursts don't double-
+  // write per frame.
+  applyImageFrameTransformThrottled(activeFrameId, undefined, next);
+  // Reflect the just-computed transform into the entry so the postMessage
+  // payload is correct (the throttled apply might not have run yet).
+  entry.image = reclampImageToCover(next, entry.frame, entry.natural);
+  postToParent("oc:editor:image-zoom", { id: activeFrameId, image: entry.image });
+}
+
+/**
+ * RAF-throttled wrapper around `applyImageFrameTransform`. Use this from the
+ * inside-frame pan/zoom hot loops AND from the parent → iframe
+ * `apply-image-transform` message handler so we coalesce burst mutations to
+ * one DOM write per animation frame (~60fps). Direct calls to
+ * `applyImageFrameTransform` still exist for tests and one-shot programmatic
+ * resets that need synchronous effect.
+ *
+ * `.flush()` runs any pending coalesced call immediately — useful at the end
+ * of a pan gesture so the final position is committed before the next frame.
+ */
+const applyImageFrameTransformThrottled = rafThrottleRuntime(
+  applyImageFrameTransform as (
+    id: string,
+    framePartial?: FrameTransformPartial,
+    imagePartial?: ImageInnerPartial
+  ) => void
+);
+
+/**
+ * Idempotent-guard analog for shapes — frame transform only, no inner image.
+ */
+function applyShapeTransform(
+  id: string,
+  framePartial?: FrameTransformPartial
+): void {
+  const entry = shapeById.get(id);
+  if (!entry) return;
+  if (!framePartial) return;
+  if (framePartial.x != null) entry.frame.x = framePartial.x;
+  if (framePartial.y != null) entry.frame.y = framePartial.y;
+  if (framePartial.w != null) entry.frame.w = framePartial.w;
+  if (framePartial.h != null) entry.frame.h = framePartial.h;
+  if (framePartial.rotation != null) entry.frame.rotation = framePartial.rotation;
+  if (framePartial.z != null) entry.frame.z = framePartial.z;
+  const f = entry.frame;
+  const nat = entry.naturalRect;
+  const close = (a: number, b: number): boolean => Math.abs(a - b) <= 1;
+  const matchesNatural =
+    close(f.x, nat.x) &&
+    close(f.y, nat.y) &&
+    close(f.w, nat.w) &&
+    close(f.h, nat.h) &&
+    f.rotation === 0;
+  if (!entry.applied && matchesNatural) return;
+  const tStr = frameTransformString(f, nat);
+  entry.el.style.transform = tStr;
+  if (Math.abs(f.w - nat.w) > 1) entry.el.style.width = f.w + "px";
+  if (Math.abs(f.h - nat.h) > 1) entry.el.style.height = f.h + "px";
+  if (f.z != null) entry.el.style.zIndex = String(f.z);
+  entry.applied = true;
+  const r = entry.el.getBoundingClientRect();
+  entry.rect = { x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
 function applyStyle(id: string, s: AppliedStyle): void {
   const entry = layerById.get(id);
   if (!entry) return;
@@ -752,6 +1742,35 @@ function modsFromEvent(ev: PointerEvent | MouseEvent): Modifiers {
 }
 
 function onPointerDown(ev: PointerEvent): void {
+  // Phase 4: inside-frame pan intercept. When in inside-frame mode AND the
+  // pointer is inside the active frame's element, capture the gesture as a
+  // pan of the IMAGE inside the frame (NOT a drag of the frame). We don't
+  // forward `oc:editor:pointer-down` so the parent stays in selection and
+  // doesn't try to drag the frame layer.
+  if (
+    currentMode === "inside-frame" &&
+    activeFrameId &&
+    isInsideActiveFrame(ev.target)
+  ) {
+    const entry = imageById.get(activeFrameId);
+    if (entry) {
+      ev.preventDefault();
+      panActive = true;
+      panStartImage = { ...entry.image };
+      const rect = entry.frameEl.getBoundingClientRect();
+      panFrameRect = { left: rect.left, top: rect.top };
+      panStartCursor = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+      panPointerId = ev.pointerId;
+      try {
+        (ev.target as Element).setPointerCapture?.(ev.pointerId);
+      } catch {
+        // setPointerCapture can throw if target is detached — safe to ignore.
+      }
+      entry.frameEl.style.cursor = "grabbing";
+      return;
+    }
+  }
+
   const id = hitTest(ev.clientX, ev.clientY);
   // If the user clicks INSIDE a layer that's currently in inline-edit mode,
   // let the browser handle text selection / caret placement — don't start a
@@ -787,6 +1806,37 @@ function onPointerDown(ev: PointerEvent): void {
 }
 
 function onPointerMove(ev: PointerEvent): void {
+  // Phase 4: inside-frame pan. Compute the frame-local cursor delta from
+  // the start, apply it to the captured starting image transform, re-clamp
+  // to the cover invariant, and emit `oc:editor:image-pan`. NO drag
+  // threshold here — pan is fine-grained (the threshold is only for the
+  // body-drag-vs-click distinction in frame mode).
+  if (panActive && panStartImage && panStartCursor && panFrameRect && activeFrameId) {
+    if (panPointerId != null && ev.pointerId !== panPointerId) {
+      // Different pointer — ignore (multi-touch case; v1 doesn't handle).
+      return;
+    }
+    const entry = imageById.get(activeFrameId);
+    if (!entry) return;
+    const cursorX = ev.clientX - panFrameRect.left;
+    const cursorY = ev.clientY - panFrameRect.top;
+    const dx = cursorX - panStartCursor.x;
+    const dy = cursorY - panStartCursor.y;
+    const next: ImageInnerLite = {
+      scale: panStartImage.scale,
+      tx: panStartImage.tx + dx,
+      ty: panStartImage.ty + dy,
+    };
+    const clamped = reclampImageToCover(next, entry.frame, entry.natural);
+    // Phase 5: throttle DOM mutation to ~60fps. Trackpad pointermove fires
+    // at 120fps; without this we burn paint cycles. We DO update the
+    // entry.image ourselves before posting so the parent sees the latest
+    // committed values regardless of when the throttled apply runs.
+    applyImageFrameTransformThrottled(activeFrameId, undefined, clamped);
+    entry.image = clamped;
+    postToParent("oc:editor:image-pan", { id: activeFrameId, image: entry.image });
+    return;
+  }
   if (!isDragging) return;
   postToParent("oc:editor:pointer-move", {
     deltaX: ev.clientX - dragStartX,
@@ -797,7 +1847,31 @@ function onPointerMove(ev: PointerEvent): void {
   });
 }
 
-function onPointerUp(): void {
+function onPointerUp(ev?: PointerEvent): void {
+  // Phase 4: end inside-frame pan if active.
+  if (panActive) {
+    panActive = false;
+    panStartImage = null;
+    panStartCursor = null;
+    panFrameRect = null;
+    panPointerId = null;
+    // Phase 5: flush any pending throttled DOM update so the final pan
+    // position is committed before the next frame (otherwise the user's
+    // last move could be lost if the rAF didn't fire before pointer-up).
+    try { applyImageFrameTransformThrottled.flush(); } catch { /* noop */ }
+    if (activeFrameId) {
+      const entry = imageById.get(activeFrameId);
+      if (entry) entry.frameEl.style.cursor = "grab";
+    }
+    if (ev) {
+      try {
+        (ev.target as Element).releasePointerCapture?.(ev.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+    return;
+  }
   if (!isDragging) return;
   isDragging = false;
   postToParent("oc:editor:pointer-up");
@@ -850,6 +1924,19 @@ function onMessage(ev: MessageEvent): void {
   } else if (type === "oc:editor:enter-inline-edit") {
     const id = payload && (payload.id as string);
     if (id) enterInlineEdit(id);
+  } else if (type === "oc:editor:apply-image-transform") {
+    const id = payload && (payload.id as string);
+    const frame = payload && (payload.frame as FrameTransformPartial | undefined);
+    const image = payload && (payload.image as ImageInnerPartial | undefined);
+    if (id) applyImageFrameTransform(id, frame, image);
+  } else if (type === "oc:editor:apply-shape-transform") {
+    const id = payload && (payload.id as string);
+    const frame = payload && (payload.frame as FrameTransformPartial | undefined);
+    if (id) applyShapeTransform(id, frame);
+  } else if (type === "oc:editor:set-frame-mode") {
+    const id = payload && (payload.id as string);
+    const mode = payload && (payload.mode as "frame" | "inside-frame");
+    if (id && mode) setFrameMode(id, mode);
   }
 }
 
@@ -864,13 +1951,18 @@ function sendReady(): void {
 
 function sendLayout(): void {
   remeasureAll();
+  // NOTE: `MeasuredLayer.kind` is still narrowed to LayerKind for Phase 2
+  // back-compat (Phase 3 will widen). Image-frame and shape entries are
+  // stamped "existing" here; parents disambiguate via the dedicated
+  // `image-frame-init` / `shape-init` boot-time messages.
   const layers = layerOrder.map((id) => {
-    const entry = layerById.get(id);
-    return {
-      id: id,
-      rect: entry ? entry.rect : { x: 0, y: 0, w: 0, h: 0 },
-      kind: entry ? entry.kind : "existing",
-    };
+    const t = layerById.get(id);
+    if (t) return { id: id, rect: t.rect, kind: t.kind };
+    const im = imageById.get(id);
+    if (im) return { id: id, rect: im.rect, kind: "existing" };
+    const sh = shapeById.get(id);
+    if (sh) return { id: id, rect: sh.rect, kind: "existing" };
+    return { id: id, rect: { x: 0, y: 0, w: 0, h: 0 }, kind: "existing" };
   });
   postToParent("oc:editor:layout", { layers: layers });
 }
@@ -880,10 +1972,20 @@ function boot(): void {
   tagAndMeasureLayers();
   sendReady();
   sendLayout();
+  // Phase 2: expose restore on window for Phase 3 to wire to the refine
+  // exit toggle. Until then it's available via DevTools as a manual escape.
+  try {
+    (window as unknown as { __ocRuntimeRestore?: () => void }).__ocRuntimeRestore = restoreStashedStyles;
+  } catch {
+    // ignore
+  }
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("pointermove", onPointerMove, true);
   document.addEventListener("pointerup", onPointerUp, true);
   document.addEventListener("pointercancel", onPointerUp, true);
+  // Phase 4: cursor-anchored wheel zoom in inside-frame mode. Capture phase
+  // + non-passive so we can preventDefault before the browser scrolls.
+  document.addEventListener("wheel", onWheel, { capture: true, passive: false });
   window.addEventListener("message", onMessage);
   // Prevent native dragstart on text/images interfering with pointer drag.
   document.addEventListener("dragstart", (e) => e.preventDefault());

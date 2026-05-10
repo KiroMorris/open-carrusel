@@ -28,13 +28,17 @@ import {
   type MutableRefObject,
 } from "react";
 import { wrapSlideHtml } from "@/lib/slide-html";
+import { rafThrottle } from "@/lib/throttle";
+import { runOverridesDiff } from "./canvasOverridesDiff";
 import type { AspectRatio, CanvasOverrides } from "@/types/carousel";
 import { DIMENSIONS } from "@/types/carousel";
 import type {
   IframeToParentMessage,
+  ImageFrameInitMessage,
   MeasuredLayer,
   Modifiers,
   ParentToIframeMessage,
+  ShapeInitMessage,
 } from "@/types/canvas";
 import { installCanvasListener, useCanvasSender } from "./useCanvasMessages";
 
@@ -63,6 +67,14 @@ export interface CanvasIframeProps {
   onDoubleClickText?: (payload: { id: string }) => void;
   /** Phase 4 — emitted on contenteditable blur after inline-edit. */
   onTextEdit?: (payload: { id: string; text: string }) => void;
+  /** Phase 3 (canvas-image-frames) — image frame init signal at boot. */
+  onImageFrameInit?: (payload: ImageFrameInitMessage["payload"]) => void;
+  /** Phase 3 (canvas-image-frames) — shape init signal at boot. */
+  onShapeInit?: (payload: ShapeInitMessage["payload"]) => void;
+  /** Phase 4 (canvas-image-frames) — image pan from inside-frame mode. */
+  onImagePan?: (payload: import("@/types/canvas").ImagePanMessage["payload"]) => void;
+  /** Phase 4 (canvas-image-frames) — image zoom from inside-frame mode. */
+  onImageZoom?: (payload: import("@/types/canvas").ImageZoomMessage["payload"]) => void;
   /** Imperative handle for parent → iframe sends. */
   sendRef?: MutableRefObject<((msg: ParentToIframeMessage) => void) | null>;
   /** Optional debug tap — sees every validated message. */
@@ -82,6 +94,10 @@ export function CanvasIframe({
   onPointerUp,
   onDoubleClickText,
   onTextEdit,
+  onImageFrameInit,
+  onShapeInit,
+  onImagePan,
+  onImageZoom,
   sendRef,
   onAnyMessage,
 }: CanvasIframeProps) {
@@ -150,53 +166,51 @@ export function CanvasIframe({
 
   // Live overrides → postMessage diff sync. Only runs once the runtime has
   // signaled `oc:editor:ready`.
+  //
+  // Phase 6 — wrap the diff dispatch in `rafThrottle` so high-frequency
+  // override mutations during pan/zoom don't blow up the postMessage channel.
+  // We collapse to one batch per animation frame (~60Hz). Latest-args wins:
+  // the throttled function reads `overrides` from `overridesRef` so a flurry
+  // of mutations within one frame produces exactly one diff against the
+  // most-recent snapshot.
+  const overridesRef = useRef<CanvasOverrides | null>(overrides ?? null);
+  useEffect(() => {
+    overridesRef.current = overrides ?? null;
+  }, [overrides]);
+
+  const isReadyRef = useRef(false);
+
+  const flushDiff = useMemo(
+    () =>
+      rafThrottle(() => {
+        if (!isReadyRef.current) return;
+        const next = overridesRef.current;
+        const prev = lastSentRef.current;
+        runOverridesDiff(next, prev, send);
+        lastSentRef.current = next;
+      }),
+    // `send` is stable (useCanvasSender memoizes); deliberately omit from
+    // deps so we don't recreate the throttle on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  // Cancel any pending RAF on unmount.
+  useEffect(() => () => flushDiff.cancel(), [flushDiff]);
+
+  useEffect(() => {
+    isReadyRef.current = isReady;
+    // When the iframe just became ready, kick a flush so the runtime sees
+    // any overrides that piled up during boot.
+    if (isReady) flushDiff();
+  }, [isReady, flushDiff]);
+
+  // Schedule a flush on every overrides mutation; the RAF throttle collapses
+  // bursts to at most one diff per animation frame.
   useEffect(() => {
     if (!isReady) return;
-    const next = overrides ?? null;
-    const prev = lastSentRef.current;
-
-    // Sync added / changed layers.
-    if (next) {
-      for (const id of next.order) {
-        const layer = next.layers[id];
-        if (!layer) continue;
-        const prevLayer = prev?.layers[id];
-        const changed =
-          !prevLayer ||
-          JSON.stringify(prevLayer.transform) !== JSON.stringify(layer.transform) ||
-          JSON.stringify(prevLayer.style) !== JSON.stringify(layer.style);
-
-        if (!prevLayer && layer.kind === "new") {
-          // Brand new layer that didn't exist in the previous snapshot or
-          // in the baked srcDoc — ask the runtime to create it.
-          send({ type: "oc:editor:add-layer", payload: { layer } });
-        } else if (changed) {
-          send({
-            type: "oc:editor:apply-transform",
-            payload: { id, transform: layer.transform },
-          });
-          send({
-            type: "oc:editor:apply-style",
-            payload: { id, style: layer.style },
-          });
-        }
-        if (layer.text != null && layer.text !== prevLayer?.text) {
-          send({ type: "oc:editor:apply-text", payload: { id, text: layer.text } });
-        }
-      }
-    }
-
-    // Sync deletions: anything in prev that's gone in next.
-    if (prev) {
-      for (const id of prev.order) {
-        if (!next?.layers[id]) {
-          send({ type: "oc:editor:delete-layer", payload: { id } });
-        }
-      }
-    }
-
-    lastSentRef.current = next;
-  }, [overrides, isReady, send]);
+    flushDiff();
+  }, [overrides, isReady, flushDiff]);
 
   // Measure outer container for scale-to-fit.
   const measure = useCallback(() => {
@@ -237,6 +251,10 @@ export function CanvasIframe({
       onPointerUp,
       onDoubleClickText,
       onTextEdit,
+      onImageFrameInit,
+      onShapeInit,
+      onImagePan,
+      onImageZoom,
       onAny: onAnyMessage,
     });
     return teardown;
@@ -249,6 +267,10 @@ export function CanvasIframe({
     onPointerUp,
     onDoubleClickText,
     onTextEdit,
+    onImageFrameInit,
+    onShapeInit,
+    onImagePan,
+    onImageZoom,
     onAnyMessage,
   ]);
 
@@ -306,3 +328,4 @@ export function CanvasIframe({
     </div>
   );
 }
+

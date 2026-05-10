@@ -11,6 +11,68 @@ import type {
 } from "@/types/carousel";
 import { MAX_SLIDES, MAX_VERSIONS } from "@/types/carousel";
 
+/**
+ * Migrate `CanvasOverrides` from the v1 schema (text-layers only) to v2
+ * (text-layers + images + shapes). Idempotent and lossless: v2 input passes
+ * through unchanged; v1 (or legacy missing-version) input gets empty
+ * `images` / `shapes` maps + `schemaVersion: 2` baked in.
+ *
+ * v1 → v2 changes:
+ *   - add `images: {}`
+ *   - add `shapes: {}`
+ *   - bump `schemaVersion` to 2
+ *   - default `order` to `Object.keys(layers)` if missing
+ *
+ * Exported for direct testing and for use by API routes that construct
+ * overrides from untrusted client JSON.
+ */
+export function migrateOverrides(
+  o: CanvasOverrides | null | undefined | Record<string, unknown>
+): CanvasOverrides | null {
+  if (!o) return (o as null | undefined) ?? null;
+  // Treat any non-object input as null — the data shape is corrupted.
+  if (typeof o !== "object") return null;
+  const raw = o as Record<string, unknown>;
+  const layers =
+    raw.layers && typeof raw.layers === "object"
+      ? (raw.layers as CanvasOverrides["layers"])
+      : {};
+  const images =
+    raw.images && typeof raw.images === "object"
+      ? (raw.images as CanvasOverrides["images"])
+      : {};
+  const shapes =
+    raw.shapes && typeof raw.shapes === "object"
+      ? (raw.shapes as CanvasOverrides["shapes"])
+      : {};
+  const order = Array.isArray(raw.order)
+    ? (raw.order as string[])
+    : Object.keys(layers);
+  return {
+    layers,
+    images,
+    shapes,
+    order,
+    schemaVersion: 2,
+  };
+}
+
+/**
+ * Returns true iff the slide carries any non-empty canvas-refine overrides
+ * (text, image-frame, or shape). Used by the API lock-guard and the chat
+ * system prompt so all writers see the same semantics.
+ */
+export function isSlideLocked(
+  slide?: Pick<Slide, "canvasOverrides"> | null
+): boolean {
+  const o = slide?.canvasOverrides;
+  if (!o) return false;
+  const layerCount = Object.keys(o.layers ?? {}).length;
+  const imageCount = Object.keys(o.images ?? {}).length;
+  const shapeCount = Object.keys(o.shapes ?? {}).length;
+  return layerCount + imageCount + shapeCount > 0;
+}
+
 /** Coerce a previousVersions entry (legacy string OR new object) into the
  * structured shape. Use ONLY for reading; preserve raw entries on write so
  * we don't rewrite legacy data unnecessarily. */
@@ -26,7 +88,28 @@ function readVersionEntry(
 const FILE = "carousels.json";
 
 async function load(): Promise<CarouselsData> {
-  return readDataSafe<CarouselsData>(FILE, { carousels: [] });
+  const data = await readDataSafe<CarouselsData>(FILE, { carousels: [] });
+  // Auto-upgrade canvasOverrides to v2 on read. The migration is lossless and
+  // idempotent — slides without overrides stay null. The upgraded shape is
+  // re-persisted the next time anything writes the carousel back to disk.
+  for (const carousel of data.carousels ?? []) {
+    for (const slide of carousel.slides ?? []) {
+      if (slide.canvasOverrides) {
+        slide.canvasOverrides = migrateOverrides(slide.canvasOverrides);
+      }
+      // Also migrate overrides embedded in previousVersions (undo history).
+      if (Array.isArray(slide.previousVersions)) {
+        slide.previousVersions = slide.previousVersions.map((entry) => {
+          if (typeof entry === "string") return entry;
+          if (entry && typeof entry === "object" && entry.overrides) {
+            return { ...entry, overrides: migrateOverrides(entry.overrides) };
+          }
+          return entry;
+        });
+      }
+    }
+  }
+  return data;
 }
 
 async function save(data: CarouselsData): Promise<void> {
@@ -162,6 +245,17 @@ export async function updateSlide(
     }
   }
 
+  // Migrate any inbound canvasOverrides up to v2 on the way in. Defends
+  // against API clients still sending v1-shaped blobs.
+  if (updates.canvasOverrides !== undefined) {
+    updates = {
+      ...updates,
+      canvasOverrides: updates.canvasOverrides
+        ? migrateOverrides(updates.canvasOverrides)
+        : updates.canvasOverrides,
+    };
+  }
+
   Object.assign(slide, updates);
   carousel.updatedAt = now();
   await save(data);
@@ -183,7 +277,7 @@ export async function setCanvasOverrides(
   const slide = carousel.slides.find((s) => s.id === slideId);
   if (!slide) return null;
 
-  slide.canvasOverrides = overrides;
+  slide.canvasOverrides = overrides ? migrateOverrides(overrides) : overrides;
   carousel.updatedAt = now();
   await save(data);
   return slide;
@@ -251,7 +345,9 @@ export async function undoSlide(
   if (typeof previousEntry === "string") {
     slide.canvasOverrides = null;
   } else {
-    slide.canvasOverrides = restored.overrides;
+    slide.canvasOverrides = restored.overrides
+      ? migrateOverrides(restored.overrides)
+      : restored.overrides;
   }
   carousel.updatedAt = now();
   await save(data);

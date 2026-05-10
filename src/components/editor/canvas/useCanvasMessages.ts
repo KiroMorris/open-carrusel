@@ -55,6 +55,33 @@ export interface CanvasIframeHandlers {
       { type: "oc:editor:text-edit" }
     >["payload"]
   ) => void;
+  // Phase 2 — image/shape init signals from the runtime.
+  onImageFrameInit?: (
+    payload: Extract<
+      IframeToParentMessage,
+      { type: "oc:editor:image-frame-init" }
+    >["payload"]
+  ) => void;
+  onShapeInit?: (
+    payload: Extract<
+      IframeToParentMessage,
+      { type: "oc:editor:shape-init" }
+    >["payload"]
+  ) => void;
+  // Phase 4 territory — defined now so the listener acks them silently
+  // instead of dropping them on the floor.
+  onImagePan?: (
+    payload: Extract<
+      IframeToParentMessage,
+      { type: "oc:editor:image-pan" }
+    >["payload"]
+  ) => void;
+  onImageZoom?: (
+    payload: Extract<
+      IframeToParentMessage,
+      { type: "oc:editor:image-zoom" }
+    >["payload"]
+  ) => void;
   /** Called for every validated message — handy for harness logging. */
   onAny?: (msg: IframeToParentMessage) => void;
 }
@@ -67,6 +94,10 @@ const ALL_TYPES = new Set<IframeToParentMessage["type"]>([
   "oc:editor:pointer-up",
   "oc:editor:dblclick-text",
   "oc:editor:text-edit",
+  "oc:editor:image-frame-init",
+  "oc:editor:shape-init",
+  "oc:editor:image-pan",
+  "oc:editor:image-zoom",
 ]);
 
 /**
@@ -108,6 +139,18 @@ export function installCanvasListener(
         break;
       case "oc:editor:text-edit":
         handlers.onTextEdit?.(msg.payload);
+        break;
+      case "oc:editor:image-frame-init":
+        handlers.onImageFrameInit?.(msg.payload);
+        break;
+      case "oc:editor:shape-init":
+        handlers.onShapeInit?.(msg.payload);
+        break;
+      case "oc:editor:image-pan":
+        handlers.onImagePan?.(msg.payload);
+        break;
+      case "oc:editor:image-zoom":
+        handlers.onImageZoom?.(msg.payload);
         break;
     }
   };

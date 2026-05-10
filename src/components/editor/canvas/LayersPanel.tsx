@@ -18,7 +18,9 @@ import {
   ChevronsDown,
   ChevronsUp,
   Eye,
+  Image as ImageIcon,
   Layers,
+  Square,
   Trash2,
   Type,
 } from "lucide-react";
@@ -27,9 +29,25 @@ import type { CanvasLayer } from "@/types/carousel";
 
 export type ZDirection = "forward" | "back" | "top" | "bottom";
 
+/**
+ * Phase 3 (canvas-image-frames). Each entry tagged with kind so we can
+ * render the right icon + label fallback. Shapes and image-frames are NOT
+ * `CanvasLayer`s (they live in `overrides.images` / `overrides.shapes`),
+ * so we accept a structural shape rather than a typed `CanvasLayer`.
+ */
+export type LayerListKind = "text-existing" | "text-new" | "image-frame" | "shape";
+
+export interface LayerListEntry {
+  id: string;
+  kind: LayerListKind;
+  /** Optional preview text — falls back to id-based label. */
+  text?: string;
+}
+
 interface LayersPanelProps {
-  /** All layers, in render order (bottom → top). */
-  layers: CanvasLayer[];
+  /** All entries, in render order (bottom → top). May include text layers
+   *  AND image-frame / shape entries. */
+  layers: LayerListEntry[];
   /** Currently selected layer ids. */
   selectedIds: string[];
   /** Layer ids whose label should reflect the source text (existing layers
@@ -41,6 +59,19 @@ interface LayersPanelProps {
   onZOrder: (id: string, direction: ZDirection) => void;
   defaultOpen?: boolean;
   className?: string;
+}
+
+/**
+ * Convenience: build a `LayerListEntry` from a text `CanvasLayer`. Kept as a
+ * helper so existing call sites that already had `CanvasLayer[]` migrate
+ * cleanly.
+ */
+export function textLayerToEntry(layer: CanvasLayer): LayerListEntry {
+  return {
+    id: layer.id,
+    kind: layer.kind === "new" ? "text-new" : "text-existing",
+    text: layer.text,
+  };
 }
 
 export function LayersPanel({
@@ -92,7 +123,15 @@ export function LayersPanel({
           )}
           {display.map((layer) => {
             const sel = selectedIds.includes(layer.id);
-            const label = (labels && labels[layer.id]) || layer.text || layer.id;
+            const fallback =
+              layer.kind === "image-frame"
+                ? `image · ${layer.id}`
+                : layer.kind === "shape"
+                  ? `shape · ${layer.id}`
+                  : layer.id;
+            const label =
+              (labels && labels[layer.id]) || layer.text || fallback;
+            const { Icon, swatch, hint } = iconFor(layer.kind);
             return (
               <li
                 key={layer.id}
@@ -105,17 +144,11 @@ export function LayersPanel({
                 <span
                   className={cn(
                     "h-4 w-4 rounded shrink-0 flex items-center justify-center",
-                    layer.kind === "new"
-                      ? "bg-[var(--brand-yellow)] text-[var(--brand-green)]"
-                      : "bg-muted text-muted-foreground"
+                    swatch
                   )}
-                  title={layer.kind === "new" ? "New layer" : "Existing layer"}
+                  title={hint}
                 >
-                  {layer.kind === "new" ? (
-                    <Type className="h-2.5 w-2.5" />
-                  ) : (
-                    <Eye className="h-2.5 w-2.5" />
-                  )}
+                  <Icon className="h-2.5 w-2.5" />
                 </span>
                 <span
                   className="flex-1 truncate text-foreground"
@@ -205,6 +238,39 @@ function IconBtn({
       {children}
     </button>
   );
+}
+
+function iconFor(kind: LayerListKind): {
+  Icon: typeof Type;
+  swatch: string;
+  hint: string;
+} {
+  switch (kind) {
+    case "text-new":
+      return {
+        Icon: Type,
+        swatch: "bg-[var(--brand-yellow)] text-[var(--brand-green)]",
+        hint: "New text layer",
+      };
+    case "text-existing":
+      return {
+        Icon: Eye,
+        swatch: "bg-muted text-muted-foreground",
+        hint: "Existing text layer",
+      };
+    case "image-frame":
+      return {
+        Icon: ImageIcon,
+        swatch: "bg-muted text-muted-foreground",
+        hint: "Image frame",
+      };
+    case "shape":
+      return {
+        Icon: Square,
+        swatch: "bg-muted text-muted-foreground",
+        hint: "Shape",
+      };
+  }
 }
 
 function truncate(s: string, n: number): string {

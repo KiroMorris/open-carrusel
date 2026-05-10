@@ -2,6 +2,7 @@ import type { BrandConfig } from "@/types/brand";
 import type { Carousel } from "@/types/carousel";
 import type { StylePreset } from "@/types/style-preset";
 import { DIMENSIONS, MAX_SLIDES } from "@/types/carousel";
+import { isSlideLocked } from "@/lib/carousels";
 
 export function buildSystemPrompt(
   brand: BrandConfig,
@@ -26,7 +27,7 @@ Use professional defaults: dark text on white/light backgrounds, Inter font, cle
 - Aspect ratio: ${carousel.aspectRatio} (${DIMENSIONS[carousel.aspectRatio].width}x${DIMENSIONS[carousel.aspectRatio].height}px)
 - Slides: ${carousel.slides.length}/${MAX_SLIDES}
 ${carousel.slides.length > 0 ? carousel.slides.map((s) => {
-  const locked = !!s.canvasOverrides && Object.keys(s.canvasOverrides.layers).length > 0;
+  const locked = isSlideLocked(s);
   return `  - Slide ${s.order + 1} (ID: ${s.id})${locked ? " [LOCKED — user-refined in canvas, do not modify or delete]" : ""}${s.notes ? ` — ${s.notes}` : ""}`;
 }).join("\n") : "  (no slides yet)"}
 ${(carousel.referenceImages?.length ?? 0) > 0 ? `\n## Reference images (use Read to view these)\n${carousel.referenceImages.map((r) => `- "${r.name}" → ${r.absPath}`).join("\n")}` : ""}`

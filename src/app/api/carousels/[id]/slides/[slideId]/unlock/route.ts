@@ -37,9 +37,19 @@ export async function POST(
 
   // No overrides → nothing to unlock. Treat as a no-op success so the UI can
   // call this endpoint defensively without erroring.
+  //
+  // Phase 6 fix: previous implementation only counted `.layers` (text). With
+  // image-frame and shape overrides shipping in Phase 1/2, a slide whose
+  // canvasOverrides carry only `images` or `shapes` would short-circuit the
+  // bake-in pass and leave the user with a "ghost lock" — the UI thought the
+  // slide was unlocked but PUT was still rejected on the next chat-source
+  // write. Count all three maps.
+  const co = slide.canvasOverrides;
   const hasOverrides =
-    !!slide.canvasOverrides &&
-    Object.keys(slide.canvasOverrides.layers).length > 0;
+    !!co &&
+    (Object.keys(co.layers ?? {}).length > 0 ||
+      Object.keys(co.images ?? {}).length > 0 ||
+      Object.keys(co.shapes ?? {}).length > 0);
   if (!hasOverrides) {
     return NextResponse.json(slide);
   }

@@ -72,6 +72,31 @@ const GROUPS: ShortcutGroup[] = [
       { keys: ["?"], label: "Show this shortcut sheet" },
     ],
   },
+  // Phase 6 — image-frame mode (Phase 3) shares text bindings (drag,
+  // resize, rotate, delete, z-order, undo, T for new text). The handle
+  // overlay handles the resize/rotate gestures the same way.
+  {
+    title: "Image frame",
+    items: [
+      { keys: ["Drag"], label: "Move the frame" },
+      { keys: ["Drag", "handle"], label: "Resize the frame" },
+      { keys: ["Drag", "rot"], label: "Rotate the frame" },
+      { keys: ["Enter"], label: "Enter inside-frame mode (pan/zoom image)" },
+      { keys: ["Dbl-click"], label: "Enter inside-frame mode" },
+    ],
+  },
+  {
+    title: "Inside frame (image)",
+    items: [
+      { keys: ["Esc"], label: "Exit inside-frame mode" },
+      { keys: ["Drag"], label: "Pan image inside the frame" },
+      { keys: ["←", "→", "↑", "↓"], label: "Pan image 1px" },
+      { keys: ["Shift", "Arrow"], label: "Pan image 10px" },
+      { keys: ["Wheel"], label: "Zoom (cursor-anchored)" },
+      { keys: ["Cmd", "Wheel"], label: "Zoom (cursor-anchored, fine)" },
+      { keys: ["0"], label: "Reset image to cover-fit" },
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------------

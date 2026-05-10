@@ -30,8 +30,35 @@ import {
   Plus,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { CanvasLayer, LayerStyle } from "@/types/carousel";
-import { LayersPanel, type ZDirection } from "./LayersPanel";
+import type {
+  CanvasLayer,
+  FrameTransform,
+  ImageOverride,
+  LayerStyle,
+  ShapeOverride,
+} from "@/types/carousel";
+import {
+  LayersPanel,
+  type LayerListEntry,
+  type ZDirection,
+} from "./LayersPanel";
+import {
+  ImageFrameInspector,
+  type SelectedFrameItem,
+} from "./ImageFrameInspector";
+
+/**
+ * Phase 3 (canvas-image-frames). The Inspector can now show one of three
+ * detail views depending on what's selected:
+ *   - text layer  → existing controls (font, color, etc.)
+ *   - image-frame → ImageFrameInspector
+ *   - shape       → ImageFrameInspector (frame controls only)
+ */
+export type InspectorSelectedItem =
+  | { kind: "text"; layer: CanvasLayer }
+  | { kind: "image-frame"; image: ImageOverride; sourceSrc?: string | null }
+  | { kind: "shape"; shape: ShapeOverride }
+  | null;
 
 export type AlignKind =
   | "left"
@@ -86,13 +113,33 @@ interface InspectorProps {
   /** All currently selected layers. When length > 1, controls show "—"
    *  for fields whose values differ. */
   selectedLayers?: CanvasLayer[];
+  /** Phase 3 (canvas-image-frames). Discriminated selection — when this is
+   *  an image-frame or shape, we render the `ImageFrameInspector` instead
+   *  of the text controls. When null/undefined, falls back to `layer`. */
+  selectedItem?: InspectorSelectedItem;
+  /** Phase 3 (canvas-image-frames). Frame mutator for image-frame / shape. */
+  onFrameChange?: (frame: Partial<FrameTransform>) => void;
+  /** Phase 3 (canvas-image-frames). Reset/delete the image/shape override. */
+  onResetFrame?: () => void;
+  /** Phase 4 (canvas-image-frames). Current mode for image-frame selection.
+   *  null/"frame" → frame controls; "inside-frame" → pan/zoom controls. */
+  imageFrameMode?: "frame" | "inside-frame" | null;
+  /** Phase 4. Toggle frame ↔ inside-frame mode for the selected image. */
+  onImageFrameModeChange?: (mode: "frame" | "inside-frame") => void;
+  /** Phase 4. Apply an image-inner partial in inside-frame mode. */
+  onImageChange?: (
+    image: Partial<import("@/types/carousel").ImageInnerTransform>
+  ) => void;
+  /** Phase 4. Reset the selected image to cover-fit. */
+  onResetImagePosition?: () => void;
   onStyleChange: (style: Partial<LayerStyle>) => void;
   /** Phase 4 — multi-select align/distribute. Disabled (hidden) when
    *  selection has < 2 layers (for align) or < 3 (for distribute). */
   onAlign?: (kind: AlignKind) => void;
   /** Phase 4 — full layer roster, in render order, for the embedded
-   *  LayersPanel. If omitted, the panel is hidden. */
-  allLayers?: CanvasLayer[];
+   *  LayersPanel. If omitted, the panel is hidden. May contain text
+   *  layers AND image-frame / shape entries. */
+  allLayers?: LayerListEntry[];
   selectedIds?: string[];
   layerLabels?: Record<string, string>;
   onSelectLayer?: (id: string, additive: boolean) => void;
@@ -110,6 +157,13 @@ interface InspectorProps {
 export function Inspector({
   layer,
   selectedLayers,
+  selectedItem,
+  onFrameChange,
+  onResetFrame,
+  imageFrameMode,
+  onImageFrameModeChange,
+  onImageChange,
+  onResetImagePosition,
   onStyleChange,
   onAlign,
   allLayers,
@@ -125,6 +179,75 @@ export function Inspector({
   const [showSwatches, setShowSwatches] = useState(false);
   const multi = (selectedLayers?.length ?? 0) > 1;
   const sharedStyle = multi ? sharedStyleFor(selectedLayers!) : layer?.style ?? null;
+
+  // Phase 3 (canvas-image-frames). When the selected item is an image-frame
+  // or shape we render a totally different right-panel detail view.
+  if (
+    selectedItem &&
+    (selectedItem.kind === "image-frame" || selectedItem.kind === "shape") &&
+    onFrameChange &&
+    onResetFrame
+  ) {
+    const frameSelected: SelectedFrameItem =
+      selectedItem.kind === "image-frame"
+        ? {
+            kind: "image-frame",
+            image: selectedItem.image,
+            sourceSrc: selectedItem.sourceSrc,
+          }
+        : { kind: "shape", shape: selectedItem.shape };
+    return (
+      <aside
+        className={cn(
+          "w-64 border-l border-border bg-surface flex flex-col shrink-0 overflow-y-auto",
+          className
+        )}
+      >
+        <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Inspector
+          </div>
+          {hasOverrides && onResetSlide && (
+            <button
+              type="button"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Discard ALL canvas edits on this slide and revert to the original?\n\nThis cannot be undone."
+                  )
+                ) {
+                  onResetSlide();
+                }
+              }}
+              className="text-[10px] text-muted-foreground hover:text-destructive uppercase tracking-wider px-2 py-0.5 rounded border border-border hover:border-destructive transition-colors"
+              title="Discard all canvas edits and revert this slide"
+            >
+              Reset slide
+            </button>
+          )}
+        </div>
+        <ImageFrameInspector
+          selected={frameSelected}
+          onFrameChange={onFrameChange}
+          onResetFrame={onResetFrame}
+          mode={imageFrameMode}
+          onModeChange={onImageFrameModeChange}
+          onImageChange={onImageChange}
+          onResetImagePosition={onResetImagePosition}
+        />
+        {allLayers && onSelectLayer && onDeleteLayer && onZOrderLayer && (
+          <LayersPanel
+            layers={allLayers}
+            selectedIds={selectedIds ?? []}
+            labels={layerLabels}
+            onSelect={onSelectLayer}
+            onDelete={onDeleteLayer}
+            onZOrder={onZOrderLayer}
+          />
+        )}
+      </aside>
+    );
+  }
 
   const handleReset = () => {
     if (!onResetSlide) return;

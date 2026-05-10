@@ -1,18 +1,10 @@
 import { NextResponse } from "next/server";
-import { updateSlide, deleteSlide, getCarousel } from "@/lib/carousels";
-
-/**
- * Phase 5 lock guard. A slide is "locked" when it has non-empty
- * canvasOverrides — the user has hand-refined it in the canvas editor and
- * Claude (or any non-canvas writer) must not blow away those edits without an
- * explicit override.
- */
-function isSlideLocked(slide: { canvasOverrides?: { layers?: Record<string, unknown> } | null } | undefined): boolean {
-  return (
-    !!slide?.canvasOverrides &&
-    Object.keys(slide.canvasOverrides.layers ?? {}).length > 0
-  );
-}
+import {
+  updateSlide,
+  deleteSlide,
+  getCarousel,
+  isSlideLocked,
+} from "@/lib/carousels";
 
 export async function PUT(
   request: Request,
